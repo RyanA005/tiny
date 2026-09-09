@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <stdint.h>
+#include <stddef.h>
 #include <string.h>
 #include <stdarg.h>
 #include <errno.h>
@@ -34,7 +35,7 @@ typedef struct {
     int32_t fd;
     uint16_t port;
     uint8_t flags;
-    uint8_t reserved;
+    uint8_t ready;
 } connection;
 
 typedef struct {
@@ -43,14 +44,9 @@ typedef struct {
     uint8_t len;
     uint8_t message[LOG_MESSAGE_SIZE];
 } log;
-    
-typedef struct {
-    uint64_t sequence;
-    connection data;
-} connection_slot;
 
 typedef struct {
-    connection_slot slots[CONNECTION_QUEUE_SIZE];
+    connection data[CONNECTION_QUEUE_SIZE];
     uint64_t head_id __attribute__((aligned(64)));
     uint64_t tail_id __attribute__((aligned(64)));
 } connection_queue;
@@ -72,7 +68,7 @@ typedef struct {
     uint32_t id;
 } worker_args;
 
-void connection_queue_init(connection_queue *q);
+void connection_copy_payload(connection *dst, const connection *src);
 uint8_t enqueue_connection(connection_queue *q, connection c);
 uint8_t dequeue_connection(connection_queue *q, connection *c);
 
@@ -82,7 +78,7 @@ void tiny_log(enum log_level level, const uint8_t *fmt, ...);
 void log_shutdown(void);
 
 void *bump_init(bump *b, uint64_t size);
-void *bump_alloc(bump *b, uint64_t size);
+void *bump_alloc(bump *b, size_t size, size_t alignment);
 void bump_reset(bump *b);
 
 void *worker(void *p);
@@ -98,7 +94,6 @@ uint64_t log_drops = 0;
 int32_t main(void) {
 
     worker_args args[WORKER_COUNT];
-    connection_queue_init(&queue);
 
     struct sockaddr_in sa, ca;
     int32_t sd, cd;
@@ -172,13 +167,13 @@ int32_t main(void) {
             memcpy(client_ip, &addr_v6->sin6_addr, 16);
             client_flags |= 0x02;
         }
-        connection c = { 
+        connection c = {
             .accept_time = accept_time,
             .ip = { client_ip[0], client_ip[1] },
             .fd = cd,
             .port = client_port,
             .flags = client_flags,
-            .reserved = 0
+            .ready = 0
         };
         if (!enqueue_connection(&queue, c)) {
             uint64_t total = __atomic_load_n(&connection_drops, __ATOMIC_RELAXED);
@@ -296,19 +291,19 @@ void tiny_log(enum log_level level, const uint8_t *fmt, ...) {
     }
 }
 
-void connection_queue_init(connection_queue *q) {
-    for (uint64_t i = 0; i < CONNECTION_QUEUE_SIZE; i++) {
-        q->slots[i].sequence = i;
-    }
-    q->head_id = 0;
-    q->tail_id = 0;
+void connection_copy_payload(connection *dst, const connection *src) {
+    dst->accept_time = src->accept_time;
+    dst->ip[0] = src->ip[0];
+    dst->ip[1] = src->ip[1];
+    dst->fd = src->fd;
+    dst->port = src->port;
+    dst->flags = src->flags;
 }
 
 uint8_t enqueue_connection(connection_queue *q, connection c) {
-    uint64_t tail = q->tail_id;
-    connection_slot *slot = &q->slots[tail & (CONNECTION_QUEUE_SIZE - 1)];
+    connection *slot = &q->data[q->tail_id & (CONNECTION_QUEUE_SIZE - 1)];
 
-    if (__atomic_load_n(&slot->sequence, __ATOMIC_ACQUIRE) != tail) {
+    if (__atomic_load_n(&slot->ready, __ATOMIC_ACQUIRE)) {
         if (c.fd >= 0) {
             close(c.fd);
         }
@@ -316,27 +311,31 @@ uint8_t enqueue_connection(connection_queue *q, connection c) {
         return 0;
     }
 
-    slot->data = c;
-    __atomic_store_n(&slot->sequence, tail + 1, __ATOMIC_RELEASE);
-    q->tail_id = tail + 1;
+    connection_copy_payload(slot, &c);
+    __atomic_store_n(&slot->ready, 1, __ATOMIC_RELEASE);
+    q->tail_id++;
     return 1;
 }
 
 uint8_t dequeue_connection(connection_queue *q, connection *c) {
-    uint64_t head = __atomic_load_n(&q->head_id, __ATOMIC_RELAXED);
+    uint64_t pos = __atomic_load_n(&q->head_id, __ATOMIC_RELAXED);
 
     while (1) {
-        connection_slot *slot = &q->slots[head & (CONNECTION_QUEUE_SIZE - 1)];
-        uint64_t sequence = __atomic_load_n(&slot->sequence, __ATOMIC_ACQUIRE);
+        connection *slot = &q->data[pos & (CONNECTION_QUEUE_SIZE - 1)];
 
-        if (sequence != head + 1) {
+        if (!__atomic_load_n(&slot->ready, __ATOMIC_ACQUIRE)) {
+            uint64_t head = __atomic_load_n(&q->head_id, __ATOMIC_RELAXED);
+            if (head != pos) {
+                pos = head;
+                continue;
+            }
             return 0;
         }
 
-        if (__atomic_compare_exchange_n(&q->head_id, &head, head + 1, 0,
+        if (__atomic_compare_exchange_n(&q->head_id, &pos, pos + 1, 0,
                                         __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
-            *c = slot->data;
-            __atomic_store_n(&slot->sequence, head + CONNECTION_QUEUE_SIZE, __ATOMIC_RELEASE);
+            connection_copy_payload(c, slot);
+            __atomic_store_n(&slot->ready, 0, __ATOMIC_RELEASE);
             return 1;
         }
     }
@@ -390,15 +389,32 @@ void *bump_init(bump *b, uint64_t size) {
     }
     return b->mem;
 }
-void *bump_alloc(bump *b, uint64_t size) {
-    uint64_t total = b->size;
-    uint64_t offset = b->offset;
-    offset = (offset + 7) & ~7;
-    if (offset + size > total) return 0;
+
+void *bump_alloc(bump *b, size_t size, size_t alignment) {
+    if (alignment == 0 || (alignment & (alignment - 1)) != 0) {
+        return NULL;
+    }
+
+    uintptr_t base = (uintptr_t)b->mem;
+    uintptr_t current = base + (uintptr_t)b->offset;
+    uintptr_t aligned = (current + (uintptr_t)alignment - 1) & ~((uintptr_t)alignment - 1);
+
+    if (aligned < current) {
+        return NULL;
+    }
+
+    size_t offset = (size_t)(aligned - base);
+    if (offset > b->size) {
+        return NULL;
+    }
+    if (size > b->size - offset) {
+        return NULL;
+    }
+
     b->offset = offset + size;
-    return b->mem + offset;
+    return (void *)aligned;
 }
+
 void bump_reset(bump *b) {
     b->offset = 0;
-    return;
 }

@@ -64,6 +64,12 @@ static const char RESPONSE_500[] =
     "Connection: close\r\n"
     "\r\n";
 
+static const char RESPONSE_400[] =
+    "HTTP/1.1 400 Bad Request\r\n"
+    "Content-Length: 0\r\n"
+    "Connection: close\r\n"
+    "\r\n";
+
 /* allow_keep: use request keepalive policy (404/403/405). Else force close. */
 static void arm_fixed(http_conn *hc, const char *close_resp, uint32_t close_len,
                       const char *keep_resp, uint32_t keep_len,
@@ -127,7 +133,61 @@ static const char *mime_from_path(const char *path, uint32_t len) {
     return "application/octet-stream";
 }
 
-static uint32_t normalize_path(const char *in, uint16_t in_len, char *out, uint32_t out_cap) {
+/* Hex nibble, or -1 if invalid. */
+static int32_t hex_val(char c) {
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    if (c >= 'A' && c <= 'F') {
+        return c - 'A' + 10;
+    }
+    if (c >= 'a' && c <= 'f') {
+        return c - 'a' + 10;
+    }
+    return -1;
+}
+
+/*
+ * Strict percent-decode into out. Rejects incomplete/invalid %XX, NUL (%00),
+ * and encoded separators (%2f / %5c) so traversal validation sees real bytes.
+ * Returns decoded length, or 0 on failure.
+ */
+static uint32_t percent_decode(const char *in, uint16_t in_len,
+                               char *out, uint32_t out_cap) {
+    uint32_t o = 0;
+    for (uint16_t i = 0; i < in_len; i++) {
+        char c = in[i];
+        if (c == '%') {
+            if ((uint16_t)(i + 2) >= in_len) {
+                return 0;
+            }
+            int32_t hi = hex_val(in[i + 1]);
+            int32_t lo = hex_val(in[i + 2]);
+            if (hi < 0 || lo < 0) {
+                return 0;
+            }
+            c = (char)((hi << 4) | lo);
+            i = (uint16_t)(i + 2);
+            if (c == '\0' || c == '/' || c == '\\') {
+                return 0;
+            }
+        }
+        if (c == '\0') {
+            return 0;
+        }
+        if (o + 1 >= out_cap) {
+            return 0;
+        }
+        out[o++] = c;
+    }
+    if (o >= out_cap) {
+        return 0;
+    }
+    out[o] = '\0';
+    return o;
+}
+
+static uint32_t normalize_path(const char *in, uint32_t in_len, char *out, uint32_t out_cap) {
     if (in_len == 0 || in[0] != '/') {
         return 0;
     }
@@ -186,6 +246,43 @@ static uint32_t normalize_path(const char *in, uint16_t in_len, char *out, uint3
     return o;
 }
 
+/* 301 to path + '/'; path is the request URL path (no query). */
+static int32_t arm_dir_redirect(http_conn *hc, const char *path, uint16_t path_len,
+                                uint64_t now_ms) {
+    /* "HTTP/1.1 301...\r\nLocation: " + path + "/\r\nConnection: ...\r\n\r\n" */
+    uint32_t need = 128u + (uint32_t)path_len + 1u;
+    char *hdr = bump_alloc(hc->arena, need, 1);
+    if (!hdr) {
+        ARM_CLOSE(hc, RESPONSE_500, now_ms);
+        return HTTP_IO_WANT_WRITE;
+    }
+
+    hc->keep = http_should_keepalive(&hc->req);
+    int32_t n = snprintf(hdr, need,
+        "HTTP/1.1 301 Moved Permanently\r\n"
+        "Location: %.*s/\r\n"
+        "Content-Length: 0\r\n"
+        "Connection: %s\r\n"
+        "\r\n",
+        (int)path_len, path,
+        hc->keep ? "keep-alive" : "close");
+    if (n < 0 || (uint32_t)n >= need) {
+        ARM_CLOSE(hc, RESPONSE_500, now_ms);
+        return HTTP_IO_WANT_WRITE;
+    }
+
+    hc->fixed = hdr;
+    hc->fixed_len = (uint32_t)n;
+    hc->fixed_off = 0;
+    hc->phase = HTTP_PHASE_WRITE_FIXED;
+    hc->deadline_ms = now_ms + HTTP_SEND_DEADLINE_MS;
+    if (hc->file_fd >= 0) {
+        close(hc->file_fd);
+        hc->file_fd = -1;
+    }
+    return HTTP_IO_WANT_WRITE;
+}
+
 static int32_t open_under_docroot(const char *rel) {
     struct open_how how;
     memset(&how, 0, sizeof(how));
@@ -236,14 +333,23 @@ int32_t static_begin(http_conn *hc, uint64_t now_ms) {
         return HTTP_IO_WANT_WRITE;
     }
 
+    char *decoded = bump_alloc(hc->arena, STATIC_PATH_MAX, 1);
     char *rel = bump_alloc(hc->arena, STATIC_PATH_MAX, 1);
-    if (!rel) {
+    if (!decoded || !rel) {
         ARM_CLOSE(hc, RESPONSE_500, now_ms);
         return HTTP_IO_WANT_WRITE;
     }
 
-    uint32_t rel_len = normalize_path(hc->buf + hc->req.path.off, hc->req.path.len,
-                                      rel, STATIC_PATH_MAX);
+    const char *raw_path = hc->buf + hc->req.path.off;
+    uint16_t raw_len = hc->req.path.len;
+
+    uint32_t dec_len = percent_decode(raw_path, raw_len, decoded, STATIC_PATH_MAX);
+    if (dec_len == 0) {
+        ARM_CLOSE(hc, RESPONSE_400, now_ms);
+        return HTTP_IO_WANT_WRITE;
+    }
+
+    uint32_t rel_len = normalize_path(decoded, dec_len, rel, STATIC_PATH_MAX);
     if (rel_len == 0) {
         ARM_KEEPABLE(hc, RESPONSE_404_CLOSE, RESPONSE_404_KEEP, now_ms);
         return HTTP_IO_WANT_WRITE;
@@ -271,6 +377,10 @@ int32_t static_begin(http_conn *hc, uint64_t now_ms) {
 
     if (S_ISDIR(st.st_mode)) {
         close(file_fd);
+        /* /foo (no trailing slash) -> 301 /foo/ so relative links resolve. */
+        if (decoded[dec_len - 1] != '/') {
+            return arm_dir_redirect(hc, raw_path, raw_len, now_ms);
+        }
         if (rel_len + 11 >= STATIC_PATH_MAX) {
             ARM_KEEPABLE(hc, RESPONSE_404_CLOSE, RESPONSE_404_KEEP, now_ms);
             return HTTP_IO_WANT_WRITE;

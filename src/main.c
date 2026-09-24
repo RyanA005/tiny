@@ -1,15 +1,19 @@
+#define _GNU_SOURCE
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <stdint.h>
 #include <string.h>
 #include <errno.h>
-#include <sys/time.h>
+#include <signal.h>
+#include <time.h>
 
 #include <sys/types.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <sys/eventfd.h>
 
 #include <pthread.h>
 
@@ -20,8 +24,6 @@
 #include "stats.h"
 #include "worker.h"
 
-#include <signal.h>
-
 #ifndef DEFAULT_PORT
 #define DEFAULT_PORT 20000
 #endif
@@ -30,9 +32,17 @@
 
 connection_queue queue = { 0 };
 
+static volatile sig_atomic_t stats_pending = 0;
+
 static void on_stats_signal(int32_t sig) {
     (void)sig;
-    stats_dump();
+    stats_pending = 1;
+}
+
+static uint64_t mono_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
 }
 
 int32_t main(int32_t argc, char **argv) {
@@ -59,9 +69,30 @@ int32_t main(int32_t argc, char **argv) {
     sa.sin_addr.s_addr = htonl(INADDR_ANY);
     sa.sin_port = htons(port);
 
+    /* Block SIGUSR1 before any threads so only the accept loop handles it. */
+    {
+        sigset_t set;
+        sigemptyset(&set);
+        sigaddset(&set, SIGUSR1);
+        pthread_sigmask(SIG_BLOCK, &set, 0);
+    }
+
     log_init();
     stats_init();
-    signal(SIGUSR1, on_stats_signal);
+    {
+        struct sigaction sa_stat;
+        memset(&sa_stat, 0, sizeof(sa_stat));
+        sa_stat.sa_handler = on_stats_signal;
+        sigemptyset(&sa_stat.sa_mask);
+        sa_stat.sa_flags = 0; /* interrupt blocking accept */
+        sigaction(SIGUSR1, &sa_stat, 0);
+    }
+    {
+        sigset_t set;
+        sigemptyset(&set);
+        sigaddset(&set, SIGUSR1);
+        pthread_sigmask(SIG_UNBLOCK, &set, 0);
+    }
 
     if (static_init(docroot) < 0) {
         log_shutdown();
@@ -107,14 +138,31 @@ int32_t main(int32_t argc, char **argv) {
              WORKER_COUNT, CONNS_PER_WORKER, SLOT_BUMP_SIZE, LOG_QUEUE_SIZE);
 
     for (uint32_t i = 0; i < WORKER_COUNT; i++) {
+        worker_wake_fds[i] = -1;
+    }
+    for (uint32_t i = 0; i < WORKER_COUNT; i++) {
+        int32_t wfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+        if (wfd < 0) {
+            tiny_log(ERROR, "[SYS] eventfd failed: %s\n", strerror(errno));
+            static_shutdown();
+            log_shutdown();
+            return 1;
+        }
+        worker_wake_fds[i] = wfd;
         args[i].id = i;
+        args[i].wake_fd = wfd;
         pthread_create(&args[i].thread, NULL, worker, &args[i]);
     }
 
-    struct timeval t;
     while (1) {
+        if (stats_pending) {
+            stats_pending = 0;
+            stats_dump();
+        }
+
         slen = sizeof(ca);
-        cd = accept(sd, (struct sockaddr *)&ca, &slen);
+        cd = accept4(sd, (struct sockaddr *)&ca, &slen,
+                     SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (cd < 0) {
             int err = errno;
             if (err == EINTR) {
@@ -124,9 +172,7 @@ int32_t main(int32_t argc, char **argv) {
             continue;
         }
 
-        gettimeofday(&t, NULL);
-
-        uint64_t accept_time = ((uint64_t)t.tv_sec * 1000000ULL) + (uint64_t)t.tv_usec;
+        uint64_t accept_time = mono_ms();
         uint64_t client_ip[2] = {0, 0};
         uint16_t client_port = 0;
         uint8_t client_flags = 0;
@@ -156,6 +202,7 @@ int32_t main(int32_t argc, char **argv) {
                      cd);
         } else {
             STAT_INC(STAT_ACCEPT);
+            worker_notify();
         }
     }
 

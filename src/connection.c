@@ -1,6 +1,5 @@
 #include "connection.h"
 
-#include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 
@@ -19,13 +18,6 @@ void connection_set_timeouts(int32_t fd) {
 
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rcv, sizeof(rcv));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &snd, sizeof(snd));
-}
-
-void connection_set_nonblock(int32_t fd) {
-    int32_t flags = fcntl(fd, F_GETFL, 0);
-    if (flags >= 0) {
-        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-    }
 }
 
 uint8_t enqueue_connection(connection_queue *q, connection c) {

@@ -8,16 +8,31 @@
 #include <string.h>
 #include <time.h>
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
 
 /* Sweep idle deadlines every N loops (or on epoll timeout). Avoids
  * clock_gettime + O(slots) work on every hot event. */
 #define DEADLINE_SWEEP_EVERY 32
+
+int32_t worker_wake_fds[WORKER_COUNT];
+static uint32_t wake_rr;
 
 typedef struct {
     uint8_t active;
     bump arena;
     http_conn hc;
 } worker_slot;
+
+void worker_notify(void) {
+    uint32_t i = __atomic_fetch_add(&wake_rr, 1, __ATOMIC_RELAXED) % WORKER_COUNT;
+    int32_t fd = worker_wake_fds[i];
+    if (fd < 0) {
+        return;
+    }
+    uint64_t one = 1;
+    ssize_t n = write(fd, &one, sizeof(one));
+    (void)n; /* EAGAIN: counter saturated; worker already has pending wake */
+}
 
 static uint64_t mono_ms(void) {
     struct timespec ts;
@@ -98,7 +113,12 @@ static int32_t try_accept_one(int32_t epfd, worker_slot *slots, uint32_t worker_
         return 1;
     }
 
-    connection_set_nonblock(c.fd);
+    /* Drop connections that aged out waiting for a worker slot. */
+    if (now > c.accept_time && (now - c.accept_time) > CONN_QUEUE_MAX_AGE_MS) {
+        close(c.fd);
+        STAT_INC(STAT_TIMEOUT);
+        return 1;
+    }
 
     worker_slot *slot = &slots[i];
     bump_reset(&slot->arena);
@@ -137,12 +157,23 @@ static int32_t try_accept_one(int32_t epfd, worker_slot *slots, uint32_t worker_
     return 1;
 }
 
+static void drain_wake(int32_t wake_fd) {
+    uint64_t cnt;
+    while (read(wake_fd, &cnt, sizeof(cnt)) < 0) {
+        if (errno == EINTR) {
+            continue;
+        }
+        break; /* EAGAIN: drained */
+    }
+}
+
 void *worker(void *p) {
     worker_args *args = (worker_args *)p;
     worker_slot slots[CONNS_PER_WORKER];
     struct epoll_event events[WORKER_EPOLL_EVENTS];
     uint32_t active = 0;
     uint32_t loop_i = 0;
+    int32_t wake_fd = args->wake_fd;
 
     TINY_LOG_INFO("[WORKER %u] starting (slots %d, arena %d)\n",
                   args->id, CONNS_PER_WORKER, SLOT_BUMP_SIZE);
@@ -164,6 +195,19 @@ void *worker(void *p) {
         return NULL;
     }
 
+    {
+        struct epoll_event ev;
+        memset(&ev, 0, sizeof(ev));
+        ev.data.u32 = WORKER_WAKE_IDX;
+        ev.events = EPOLLIN;
+        if (epoll_ctl(epfd, EPOLL_CTL_ADD, wake_fd, &ev) < 0) {
+            tiny_log(ERROR, "[WORKER %u] epoll add wake_fd failed: %s\n",
+                     args->id, strerror(errno));
+            close(epfd);
+            return NULL;
+        }
+    }
+
     while (1) {
         uint64_t now = mono_ms();
         while (try_accept_one(epfd, slots, args->id, now)) {
@@ -175,7 +219,8 @@ void *worker(void *p) {
             active += slots[i].active;
         }
 
-        int32_t timeout = active ? WORKER_EPOLL_WAIT_MS : 10;
+        /* Idle workers sleep until eventfd wake; busy ones use deadline timeout. */
+        int32_t timeout = active ? WORKER_EPOLL_WAIT_MS : -1;
         int32_t n = epoll_wait(epfd, events, WORKER_EPOLL_EVENTS, timeout);
         now = mono_ms();
         loop_i++;
@@ -191,6 +236,10 @@ void *worker(void *p) {
 
         for (int32_t ei = 0; ei < n; ei++) {
             uint32_t idx = events[ei].data.u32;
+            if (idx == WORKER_WAKE_IDX) {
+                drain_wake(wake_fd);
+                continue;
+            }
             if (idx >= CONNS_PER_WORKER || !slots[idx].active) {
                 continue;
             }

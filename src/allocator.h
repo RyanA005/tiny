@@ -4,8 +4,6 @@
 #include <stdlib.h>
 #include <stdint.h>
 
-#define WORKER_BUMP_SIZE 102400
-
 typedef struct {
   uint64_t offset;
   uint64_t size;

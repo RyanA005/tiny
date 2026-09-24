@@ -17,17 +17,38 @@
 #include "connection.h"
 #include "logger.h"
 #include "static.h"
+#include "stats.h"
 #include "worker.h"
 
+#include <signal.h>
+
+#ifndef DEFAULT_PORT
 #define DEFAULT_PORT 20000
+#endif
 #define DEFAULT_DOCROOT "./www"
 #define MAX_BACKLOG 1024
 
 connection_queue queue = { 0 };
 
-int32_t main() {
+static void on_stats_signal(int32_t sig) {
+    (void)sig;
+    stats_dump();
+}
+
+int32_t main(int32_t argc, char **argv) {
     worker_args args[WORKER_COUNT];
     const char *docroot = DEFAULT_DOCROOT;
+    uint16_t port = DEFAULT_PORT;
+
+    if (argc >= 2) {
+        docroot = argv[1];
+    }
+    if (argc >= 3) {
+        int32_t p = atoi(argv[2]);
+        if (p > 0 && p < 65536) {
+            port = (uint16_t)p;
+        }
+    }
 
     struct sockaddr_in sa;
     struct sockaddr_storage ca;
@@ -36,9 +57,11 @@ int32_t main() {
     memset(&sa, 0, sizeof(sa));
     sa.sin_family = AF_INET;
     sa.sin_addr.s_addr = htonl(INADDR_ANY);
-    sa.sin_port = htons(DEFAULT_PORT);
+    sa.sin_port = htons(port);
 
     log_init();
+    stats_init();
+    signal(SIGUSR1, on_stats_signal);
 
     if (static_init(docroot) < 0) {
         log_shutdown();
@@ -52,9 +75,19 @@ int32_t main() {
         log_shutdown();
         return 1;
     }
+    {
+        int on = 1;
+        if (setsockopt(sd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) < 0) {
+            int err = errno;
+            tiny_log(ERROR, "[SYS] SO_REUSEADDR failed: %s\n", strerror(err));
+            static_shutdown();
+            log_shutdown();
+            return 1;
+        }
+    }
     if (bind(sd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
         int err = errno;
-        tiny_log(ERROR, "[SYS] bind failed on port %d: %s\n", DEFAULT_PORT, strerror(err));
+        tiny_log(ERROR, "[SYS] bind failed on port %d: %s\n", port, strerror(err));
         static_shutdown();
         log_shutdown();
         return 1;
@@ -62,16 +95,16 @@ int32_t main() {
     if (listen(sd, MAX_BACKLOG) < 0) {
         int err = errno;
         tiny_log(ERROR, "[SYS] listen failed on port %d (backlog %d): %s\n",
-                 DEFAULT_PORT, MAX_BACKLOG, strerror(err));
+                 port, MAX_BACKLOG, strerror(err));
         static_shutdown();
         log_shutdown();
         return 1;
     }
 
     tiny_log(INFO, "[SYS] listening on 0.0.0.0:%d (backlog %d, queue %d)\n",
-             DEFAULT_PORT, MAX_BACKLOG, CONNECTION_QUEUE_SIZE);
-    tiny_log(INFO, "[SYS] starting %d workers (bump %d, log queue %d)\n",
-             WORKER_COUNT, WORKER_BUMP_SIZE, LOG_QUEUE_SIZE);
+             port, MAX_BACKLOG, CONNECTION_QUEUE_SIZE);
+    tiny_log(INFO, "[SYS] starting %d workers (%d slots x %d bump, log queue %d)\n",
+             WORKER_COUNT, CONNS_PER_WORKER, SLOT_BUMP_SIZE, LOG_QUEUE_SIZE);
 
     for (uint32_t i = 0; i < WORKER_COUNT; i++) {
         args[i].id = i;
@@ -118,8 +151,11 @@ int32_t main() {
             .ready = 0
         };
         if (!enqueue_connection(&queue, c)) {
+            STAT_INC(STAT_QUEUE_DROP);
             tiny_log(WARNING, "[SYS] connection queue full, dropped fd=%d\n",
                      cd);
+        } else {
+            STAT_INC(STAT_ACCEPT);
         }
     }
 

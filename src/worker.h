@@ -15,8 +15,12 @@
 #include "logger.h"
 #include "http.h"
 
-#define WORKER_BUMP_SIZE 102400
+/* Per-slot arena: request buf 4K + path 4K + resp hdr + padding. */
+#define SLOT_BUMP_SIZE 12288
+#define CONNS_PER_WORKER 32
 #define WORKER_COUNT 4
+#define WORKER_EPOLL_WAIT_MS 50
+#define WORKER_EPOLL_EVENTS 64
 
 extern connection_queue queue;
 

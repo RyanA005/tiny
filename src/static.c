@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #include "logger.h"
+#include "stats.h"
 
 #define STATIC_HDR_SIZE 256
 #define STATIC_PATH_MAX 4096
@@ -47,27 +48,17 @@ static const char RESPONSE_500[] =
     "Connection: close\r\n"
     "\r\n";
 
-static int32_t write_all(int32_t fd, const void *buf, uint32_t len) {
-    const uint8_t *p = buf;
-    uint32_t off = 0;
-
-    while (off < len) {
-        ssize_t n = send(fd, p + off, len - off, MSG_NOSIGNAL);
-        if (n < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            return -1;
-        }
-        if (n == 0) {
-            return -1;
-        }
-        off += (uint32_t)n;
+static void arm_fixed(http_conn *hc, const char *resp, uint32_t len, uint64_t now_ms) {
+    hc->fixed = resp;
+    hc->fixed_len = len;
+    hc->fixed_off = 0;
+    hc->phase = HTTP_PHASE_WRITE_FIXED;
+    hc->deadline_ms = now_ms + HTTP_SEND_DEADLINE_MS;
+    if (hc->file_fd >= 0) {
+        close(hc->file_fd);
+        hc->file_fd = -1;
     }
-    return 0;
 }
-
-#define SEND_STATIC(fd, r) write_all((fd), (r), (uint32_t)(sizeof(r) - 1))
 
 static const char *mime_from_path(const char *path, uint32_t len) {
     const char *dot = 0;
@@ -108,7 +99,7 @@ static uint32_t normalize_path(const char *in, uint16_t in_len, char *out, uint3
     }
 
     uint32_t o = 0;
-    uint32_t i = 1; // skip leading /
+    uint32_t i = 1;
 
     while (i < in_len) {
         while (i < in_len && in[i] == '/') {
@@ -127,7 +118,6 @@ static uint32_t normalize_path(const char *in, uint16_t in_len, char *out, uint3
         }
         uint32_t seg_len = i - seg_start;
 
-        /* refuse . .. .env .git and any other dot-prefixed segment */
         if (seg_len >= 1 && in[seg_start] == '.') {
             return 0;
         }
@@ -171,41 +161,9 @@ static int32_t open_under_docroot(const char *rel) {
     return (int32_t)syscall(SYS_openat2, docroot_fd, rel, &how, sizeof(how));
 }
 
-static int32_t sendfile_all(int32_t out_fd, int32_t in_fd, off_t size) {
-    off_t offset = 0;
-
-    while (offset < size) {
-        size_t want = (size_t)(size - offset);
-        ssize_t n = sendfile(out_fd, in_fd, &offset, want);
-        if (n < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            // kernel can reject large count
-            if (errno == EINVAL && want > (1u << 20)) {
-                n = sendfile(out_fd, in_fd, &offset, 1u << 20);
-                if (n < 0) {
-                    if (errno == EINTR) {
-                        continue;
-                    }
-                    return -1;
-                }
-                if (n == 0) {
-                    return -1;
-                }
-                continue;
-            }
-            return -1;
-        }
-        if (n == 0) {
-            return -1;
-        }
-    }
-    return 0;
-}
-
-static void cork(int32_t fd, int32_t on) {
-    setsockopt(fd, IPPROTO_TCP, TCP_CORK, &on, sizeof(on));
+static void cork(http_conn *hc, int32_t on) {
+    setsockopt(hc->conn.fd, IPPROTO_TCP, TCP_CORK, &on, sizeof(on));
+    hc->cork_on = on ? 1 : 0;
 }
 
 int32_t static_init(const char *docroot) {
@@ -231,55 +189,57 @@ void static_shutdown(void) {
     }
 }
 
-void static_serve(connection *c, bump *b, const char *req_buf, const http_request *req) {
-    if (req->method != HTTP_METHOD_GET && req->method != HTTP_METHOD_HEAD) {
-        SEND_STATIC(c->fd, RESPONSE_405);
-        return;
+int32_t static_begin(http_conn *hc, uint64_t now_ms) {
+    STAT_TIME_BEGIN(begin);
+
+    if (hc->req.method != HTTP_METHOD_GET && hc->req.method != HTTP_METHOD_HEAD) {
+        arm_fixed(hc, RESPONSE_405, (uint32_t)(sizeof(RESPONSE_405) - 1), now_ms);
+        return HTTP_IO_WANT_WRITE;
     }
 
     if (docroot_fd < 0) {
-        SEND_STATIC(c->fd, RESPONSE_500);
-        return;
+        arm_fixed(hc, RESPONSE_500, (uint32_t)(sizeof(RESPONSE_500) - 1), now_ms);
+        return HTTP_IO_WANT_WRITE;
     }
 
-    char *rel = bump_alloc(b, STATIC_PATH_MAX, 1);
+    char *rel = bump_alloc(hc->arena, STATIC_PATH_MAX, 1);
     if (!rel) {
-        SEND_STATIC(c->fd, RESPONSE_500);
-        return;
+        arm_fixed(hc, RESPONSE_500, (uint32_t)(sizeof(RESPONSE_500) - 1), now_ms);
+        return HTTP_IO_WANT_WRITE;
     }
 
-    uint32_t rel_len = normalize_path(req_buf + req->path.off, req->path.len, rel, STATIC_PATH_MAX);
+    uint32_t rel_len = normalize_path(hc->buf + hc->req.path.off, hc->req.path.len,
+                                      rel, STATIC_PATH_MAX);
     if (rel_len == 0) {
-        SEND_STATIC(c->fd, RESPONSE_404);
-        return;
+        arm_fixed(hc, RESPONSE_404, (uint32_t)(sizeof(RESPONSE_404) - 1), now_ms);
+        return HTTP_IO_WANT_WRITE;
     }
 
     int32_t file_fd = open_under_docroot(rel);
     if (file_fd < 0) {
         if (errno == ENOENT || errno == ENOTDIR) {
-            SEND_STATIC(c->fd, RESPONSE_404);
+            arm_fixed(hc, RESPONSE_404, (uint32_t)(sizeof(RESPONSE_404) - 1), now_ms);
         } else if (errno == EACCES || errno == EPERM || errno == ELOOP) {
-            SEND_STATIC(c->fd, RESPONSE_403);
+            arm_fixed(hc, RESPONSE_403, (uint32_t)(sizeof(RESPONSE_403) - 1), now_ms);
         } else {
             tiny_log(WARNING, "[STATIC] open '%s' failed: %s\n", rel, strerror(errno));
-            SEND_STATIC(c->fd, RESPONSE_500);
+            arm_fixed(hc, RESPONSE_500, (uint32_t)(sizeof(RESPONSE_500) - 1), now_ms);
         }
-        return;
+        return HTTP_IO_WANT_WRITE;
     }
 
     struct stat st;
     if (fstat(file_fd, &st) < 0) {
         close(file_fd);
-        SEND_STATIC(c->fd, RESPONSE_500);
-        return;
+        arm_fixed(hc, RESPONSE_500, (uint32_t)(sizeof(RESPONSE_500) - 1), now_ms);
+        return HTTP_IO_WANT_WRITE;
     }
 
-    // /foo where foo is a directory: try foo/index.html once
     if (S_ISDIR(st.st_mode)) {
         close(file_fd);
         if (rel_len + 11 >= STATIC_PATH_MAX) {
-            SEND_STATIC(c->fd, RESPONSE_404);
-            return;
+            arm_fixed(hc, RESPONSE_404, (uint32_t)(sizeof(RESPONSE_404) - 1), now_ms);
+            return HTTP_IO_WANT_WRITE;
         }
         memcpy(rel + rel_len, "/index.html", 11);
         rel_len += 11;
@@ -287,34 +247,28 @@ void static_serve(connection *c, bump *b, const char *req_buf, const http_reques
 
         file_fd = open_under_docroot(rel);
         if (file_fd < 0) {
-            SEND_STATIC(c->fd, RESPONSE_404);
-            return;
+            arm_fixed(hc, RESPONSE_404, (uint32_t)(sizeof(RESPONSE_404) - 1), now_ms);
+            return HTTP_IO_WANT_WRITE;
         }
         if (fstat(file_fd, &st) < 0) {
             close(file_fd);
-            SEND_STATIC(c->fd, RESPONSE_500);
-            return;
+            arm_fixed(hc, RESPONSE_500, (uint32_t)(sizeof(RESPONSE_500) - 1), now_ms);
+            return HTTP_IO_WANT_WRITE;
         }
     }
 
-    if (!S_ISREG(st.st_mode)) {
+    if (!S_ISREG(st.st_mode) || st.st_size < 0) {
         close(file_fd);
-        SEND_STATIC(c->fd, RESPONSE_403);
-        return;
-    }
-
-    if (st.st_size < 0) {
-        close(file_fd);
-        SEND_STATIC(c->fd, RESPONSE_500);
-        return;
+        arm_fixed(hc, RESPONSE_403, (uint32_t)(sizeof(RESPONSE_403) - 1), now_ms);
+        return HTTP_IO_WANT_WRITE;
     }
 
     const char *mime = mime_from_path(rel, rel_len);
-    char *hdr = bump_alloc(b, STATIC_HDR_SIZE, 1);
+    char *hdr = bump_alloc(hc->arena, STATIC_HDR_SIZE, 1);
     if (!hdr) {
         close(file_fd);
-        SEND_STATIC(c->fd, RESPONSE_500);
-        return;
+        arm_fixed(hc, RESPONSE_500, (uint32_t)(sizeof(RESPONSE_500) - 1), now_ms);
+        return HTTP_IO_WANT_WRITE;
     }
 
     int32_t hdr_len = snprintf(hdr, STATIC_HDR_SIZE,
@@ -328,24 +282,105 @@ void static_serve(connection *c, bump *b, const char *req_buf, const http_reques
 
     if (hdr_len < 0 || (uint32_t)hdr_len >= STATIC_HDR_SIZE) {
         close(file_fd);
-        SEND_STATIC(c->fd, RESPONSE_500);
-        return;
+        arm_fixed(hc, RESPONSE_500, (uint32_t)(sizeof(RESPONSE_500) - 1), now_ms);
+        return HTTP_IO_WANT_WRITE;
     }
 
-    cork(c->fd, 1);
+    hc->out_hdr = hdr;
+    hc->out_hdr_len = (uint32_t)hdr_len;
+    hc->out_hdr_off = 0;
+    hc->file_fd = file_fd;
+    hc->file_size = st.st_size;
+    hc->file_off = 0;
+    hc->send_body = (hc->req.method == HTTP_METHOD_GET && st.st_size > 0) ? 1 : 0;
+    hc->phase = HTTP_PHASE_WRITE_HDR;
+    hc->deadline_ms = now_ms + HTTP_SEND_DEADLINE_MS;
+    cork(hc, 1);
+    STAT_TIME_END(STAT_NS_BEGIN, begin);
+    return HTTP_IO_WANT_WRITE;
+}
 
-    if (write_all(c->fd, hdr, (uint32_t)hdr_len) < 0) {
-        cork(c->fd, 0);
-        close(file_fd);
-        return;
+int32_t static_on_write(http_conn *hc, uint64_t now_ms) {
+    (void)now_ms;
+
+    if (hc->phase == HTTP_PHASE_WRITE_HDR) {
+        STAT_TIME_BEGIN(whdr);
+        while (hc->out_hdr_off < hc->out_hdr_len) {
+            ssize_t n = send(hc->conn.fd, hc->out_hdr + hc->out_hdr_off,
+                             hc->out_hdr_len - hc->out_hdr_off, MSG_NOSIGNAL);
+            if (n < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    STAT_INC(STAT_EAGAIN_WRITE);
+                    STAT_TIME_END(STAT_NS_WRITE_HDR, whdr);
+                    return HTTP_IO_WANT_WRITE;
+                }
+                STAT_TIME_END(STAT_NS_WRITE_HDR, whdr);
+                return HTTP_IO_CLOSE;
+            }
+            if (n == 0) {
+                STAT_TIME_END(STAT_NS_WRITE_HDR, whdr);
+                return HTTP_IO_CLOSE;
+            }
+            hc->out_hdr_off += (uint32_t)n;
+        }
+        STAT_TIME_END(STAT_NS_WRITE_HDR, whdr);
+
+        if (!hc->send_body) {
+            cork(hc, 0);
+            if (hc->file_fd >= 0) {
+                close(hc->file_fd);
+                hc->file_fd = -1;
+            }
+            STAT_INC(STAT_REQ_OK);
+#ifdef TINY_STATS
+            if (hc->t_start_ns) {
+                STAT_ADD(STAT_NS_TOTAL, stats_now_ns() - hc->t_start_ns);
+            }
+#endif
+            return HTTP_IO_DONE;
+        }
+        hc->phase = HTTP_PHASE_SENDFILE;
     }
 
-    if (req->method == HTTP_METHOD_GET && st.st_size > 0) {
-        if (sendfile_all(c->fd, file_fd, st.st_size) < 0) {
-            tiny_log(WARNING, "[STATIC] sendfile '%s' failed: %s\n", rel, strerror(errno));
+    STAT_TIME_BEGIN(sf);
+    while (hc->file_off < hc->file_size) {
+        size_t want = (size_t)(hc->file_size - hc->file_off);
+        if (want > (1u << 20)) {
+            want = 1u << 20;
+        }
+        ssize_t n = sendfile(hc->conn.fd, hc->file_fd, &hc->file_off, want);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                STAT_INC(STAT_EAGAIN_WRITE);
+                STAT_TIME_END(STAT_NS_SENDFILE, sf);
+                return HTTP_IO_WANT_WRITE;
+            }
+            STAT_TIME_END(STAT_NS_SENDFILE, sf);
+            return HTTP_IO_CLOSE;
+        }
+        if (n == 0) {
+            STAT_TIME_END(STAT_NS_SENDFILE, sf);
+            return HTTP_IO_CLOSE;
         }
     }
+    STAT_TIME_END(STAT_NS_SENDFILE, sf);
 
-    cork(c->fd, 0);
-    close(file_fd);
+    cork(hc, 0);
+    if (hc->file_fd >= 0) {
+        close(hc->file_fd);
+        hc->file_fd = -1;
+    }
+    STAT_INC(STAT_REQ_OK);
+#ifdef TINY_STATS
+    if (hc->t_start_ns) {
+        STAT_ADD(STAT_NS_TOTAL, stats_now_ns() - hc->t_start_ns);
+    }
+#endif
+    return HTTP_IO_DONE;
 }

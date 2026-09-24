@@ -1,5 +1,9 @@
 #include "connection.h"
 
+#include <fcntl.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+
 void connection_copy_payload(connection *dst, const connection *src) {
     dst->accept_time = src->accept_time;
     dst->ip[0] = src->ip[0];
@@ -7,6 +11,21 @@ void connection_copy_payload(connection *dst, const connection *src) {
     dst->fd = src->fd;
     dst->port = src->port;
     dst->flags = src->flags;
+}
+
+void connection_set_timeouts(int32_t fd) {
+    struct timeval rcv = { .tv_sec = CONN_RECV_TIMEOUT_SEC, .tv_usec = 0 };
+    struct timeval snd = { .tv_sec = CONN_SEND_TIMEOUT_SEC, .tv_usec = 0 };
+
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rcv, sizeof(rcv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &snd, sizeof(snd));
+}
+
+void connection_set_nonblock(int32_t fd) {
+    int32_t flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) {
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    }
 }
 
 uint8_t enqueue_connection(connection_queue *q, connection c) {
@@ -48,4 +67,3 @@ uint8_t dequeue_connection(connection_queue *q, connection *c) {
         }
     }
 }
-

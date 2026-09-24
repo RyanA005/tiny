@@ -6,6 +6,10 @@
 
 #define CONNECTION_QUEUE_SIZE 1024
 
+/* Per-syscall stalls; absolute deadlines in http/static cap total time. */
+#define CONN_RECV_TIMEOUT_SEC 5
+#define CONN_SEND_TIMEOUT_SEC 5
+
 typedef struct {
     uint64_t accept_time;
     uint64_t ip[2];
@@ -24,5 +28,7 @@ typedef struct {
 void connection_copy_payload(connection *dst, const connection *src);
 uint8_t enqueue_connection(connection_queue *q, connection c);
 uint8_t dequeue_connection(connection_queue *q, connection *c);
+void connection_set_timeouts(int32_t fd);
+void connection_set_nonblock(int32_t fd);
 
 #endif

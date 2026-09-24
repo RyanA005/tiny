@@ -127,10 +127,8 @@ static uint32_t normalize_path(const char *in, uint16_t in_len, char *out, uint3
         }
         uint32_t seg_len = i - seg_start;
 
-        if (seg_len == 1 && in[seg_start] == '.') {
-            continue;
-        }
-        if (seg_len == 2 && in[seg_start] == '.' && in[seg_start + 1] == '.') {
+        /* refuse . .. .env .git and any other dot-prefixed segment */
+        if (seg_len >= 1 && in[seg_start] == '.') {
             return 0;
         }
 

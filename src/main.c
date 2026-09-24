@@ -16,15 +16,18 @@
 #include "allocator.h"
 #include "connection.h"
 #include "logger.h"
+#include "static.h"
 #include "worker.h"
 
 #define DEFAULT_PORT 20000
+#define DEFAULT_DOCROOT "./www"
 #define MAX_BACKLOG 1024
 
 connection_queue queue = { 0 };
 
-int32_t main(void) {
+int32_t main() {
     worker_args args[WORKER_COUNT];
+    const char *docroot = DEFAULT_DOCROOT;
 
     struct sockaddr_in sa;
     struct sockaddr_storage ca;
@@ -37,15 +40,22 @@ int32_t main(void) {
 
     log_init();
 
+    if (static_init(docroot) < 0) {
+        log_shutdown();
+        return 1;
+    }
+
     if ((sd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
         int err = errno;
         tiny_log(ERROR, "[SYS] socket create failed: %s\n", strerror(err));
+        static_shutdown();
         log_shutdown();
         return 1;
     }
     if (bind(sd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
         int err = errno;
         tiny_log(ERROR, "[SYS] bind failed on port %d: %s\n", DEFAULT_PORT, strerror(err));
+        static_shutdown();
         log_shutdown();
         return 1;
     }
@@ -53,6 +63,7 @@ int32_t main(void) {
         int err = errno;
         tiny_log(ERROR, "[SYS] listen failed on port %d (backlog %d): %s\n",
                  DEFAULT_PORT, MAX_BACKLOG, strerror(err));
+        static_shutdown();
         log_shutdown();
         return 1;
     }

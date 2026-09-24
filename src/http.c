@@ -1,17 +1,10 @@
 #include "http.h"
+#include "static.h"
 
 #include <errno.h>
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/socket.h>
-
-static const char RESPONSE_200[] =
-    "HTTP/1.1 200 OK\r\n"
-    "Content-Length: 2\r\n"
-    "Content-Type: text/plain\r\n"
-    "Connection: close\r\n"
-    "\r\n"
-    "OK";
 
 static const char RESPONSE_400[] =
     "HTTP/1.1 400 Bad Request\r\n"
@@ -90,10 +83,7 @@ void do_http(connection *c, bump *b) {
             return;
         }
 
-        uint32_t body_in_buffer = used - req.header_bytes;
-        (void)body_in_buffer;
-
-        SEND_STATIC(c->fd, RESPONSE_200);
+        static_serve(c, b, buf, &req);
         return;
     }
 

@@ -23,23 +23,39 @@
 
 static int32_t docroot_fd = -1;
 
-static const char RESPONSE_403[] =
+static const char RESPONSE_403_CLOSE[] =
     "HTTP/1.1 403 Forbidden\r\n"
     "Content-Length: 0\r\n"
     "Connection: close\r\n"
     "\r\n";
+static const char RESPONSE_403_KEEP[] =
+    "HTTP/1.1 403 Forbidden\r\n"
+    "Content-Length: 0\r\n"
+    "Connection: keep-alive\r\n"
+    "\r\n";
 
-static const char RESPONSE_404[] =
+static const char RESPONSE_404_CLOSE[] =
     "HTTP/1.1 404 Not Found\r\n"
     "Content-Length: 0\r\n"
     "Connection: close\r\n"
     "\r\n";
+static const char RESPONSE_404_KEEP[] =
+    "HTTP/1.1 404 Not Found\r\n"
+    "Content-Length: 0\r\n"
+    "Connection: keep-alive\r\n"
+    "\r\n";
 
-static const char RESPONSE_405[] =
+static const char RESPONSE_405_CLOSE[] =
     "HTTP/1.1 405 Method Not Allowed\r\n"
     "Content-Length: 0\r\n"
     "Allow: GET, HEAD\r\n"
     "Connection: close\r\n"
+    "\r\n";
+static const char RESPONSE_405_KEEP[] =
+    "HTTP/1.1 405 Method Not Allowed\r\n"
+    "Content-Length: 0\r\n"
+    "Allow: GET, HEAD\r\n"
+    "Connection: keep-alive\r\n"
     "\r\n";
 
 static const char RESPONSE_500[] =
@@ -48,9 +64,20 @@ static const char RESPONSE_500[] =
     "Connection: close\r\n"
     "\r\n";
 
-static void arm_fixed(http_conn *hc, const char *resp, uint32_t len, uint64_t now_ms) {
-    hc->fixed = resp;
-    hc->fixed_len = len;
+/* allow_keep: use request keepalive policy (404/403/405). Else force close. */
+static void arm_fixed(http_conn *hc, const char *close_resp, uint32_t close_len,
+                      const char *keep_resp, uint32_t keep_len,
+                      uint8_t allow_keep, uint64_t now_ms) {
+    uint8_t keep = allow_keep && http_should_keepalive(&hc->req);
+    if (keep && keep_resp) {
+        hc->fixed = keep_resp;
+        hc->fixed_len = keep_len;
+        hc->keep = 1;
+    } else {
+        hc->fixed = close_resp;
+        hc->fixed_len = close_len;
+        hc->keep = 0;
+    }
     hc->fixed_off = 0;
     hc->phase = HTTP_PHASE_WRITE_FIXED;
     hc->deadline_ms = now_ms + HTTP_SEND_DEADLINE_MS;
@@ -59,6 +86,13 @@ static void arm_fixed(http_conn *hc, const char *resp, uint32_t len, uint64_t no
         hc->file_fd = -1;
     }
 }
+
+#define ARM_CLOSE(hc, resp, now) \
+    arm_fixed((hc), (resp), (uint32_t)(sizeof(resp) - 1), 0, 0, 0, (now))
+#define ARM_KEEPABLE(hc, close_r, keep_r, now) \
+    arm_fixed((hc), (close_r), (uint32_t)(sizeof(close_r) - 1), \
+              (keep_r), (uint32_t)(sizeof(keep_r) - 1), 1, (now))
+
 
 static const char *mime_from_path(const char *path, uint32_t len) {
     const char *dot = 0;
@@ -178,7 +212,7 @@ int32_t static_init(const char *docroot) {
     }
 
     docroot_fd = fd;
-    tiny_log(INFO, "[STATIC] docroot '%s' (fd=%d)\n", docroot, fd);
+    TINY_LOG_INFO("[STATIC] docroot '%s' (fd=%d)\n", docroot, fd);
     return 0;
 }
 
@@ -193,37 +227,37 @@ int32_t static_begin(http_conn *hc, uint64_t now_ms) {
     STAT_TIME_BEGIN(begin);
 
     if (hc->req.method != HTTP_METHOD_GET && hc->req.method != HTTP_METHOD_HEAD) {
-        arm_fixed(hc, RESPONSE_405, (uint32_t)(sizeof(RESPONSE_405) - 1), now_ms);
+        ARM_KEEPABLE(hc, RESPONSE_405_CLOSE, RESPONSE_405_KEEP, now_ms);
         return HTTP_IO_WANT_WRITE;
     }
 
     if (docroot_fd < 0) {
-        arm_fixed(hc, RESPONSE_500, (uint32_t)(sizeof(RESPONSE_500) - 1), now_ms);
+        ARM_CLOSE(hc, RESPONSE_500, now_ms);
         return HTTP_IO_WANT_WRITE;
     }
 
     char *rel = bump_alloc(hc->arena, STATIC_PATH_MAX, 1);
     if (!rel) {
-        arm_fixed(hc, RESPONSE_500, (uint32_t)(sizeof(RESPONSE_500) - 1), now_ms);
+        ARM_CLOSE(hc, RESPONSE_500, now_ms);
         return HTTP_IO_WANT_WRITE;
     }
 
     uint32_t rel_len = normalize_path(hc->buf + hc->req.path.off, hc->req.path.len,
                                       rel, STATIC_PATH_MAX);
     if (rel_len == 0) {
-        arm_fixed(hc, RESPONSE_404, (uint32_t)(sizeof(RESPONSE_404) - 1), now_ms);
+        ARM_KEEPABLE(hc, RESPONSE_404_CLOSE, RESPONSE_404_KEEP, now_ms);
         return HTTP_IO_WANT_WRITE;
     }
 
     int32_t file_fd = open_under_docroot(rel);
     if (file_fd < 0) {
         if (errno == ENOENT || errno == ENOTDIR) {
-            arm_fixed(hc, RESPONSE_404, (uint32_t)(sizeof(RESPONSE_404) - 1), now_ms);
+            ARM_KEEPABLE(hc, RESPONSE_404_CLOSE, RESPONSE_404_KEEP, now_ms);
         } else if (errno == EACCES || errno == EPERM || errno == ELOOP) {
-            arm_fixed(hc, RESPONSE_403, (uint32_t)(sizeof(RESPONSE_403) - 1), now_ms);
+            ARM_KEEPABLE(hc, RESPONSE_403_CLOSE, RESPONSE_403_KEEP, now_ms);
         } else {
             tiny_log(WARNING, "[STATIC] open '%s' failed: %s\n", rel, strerror(errno));
-            arm_fixed(hc, RESPONSE_500, (uint32_t)(sizeof(RESPONSE_500) - 1), now_ms);
+            ARM_CLOSE(hc, RESPONSE_500, now_ms);
         }
         return HTTP_IO_WANT_WRITE;
     }
@@ -231,14 +265,14 @@ int32_t static_begin(http_conn *hc, uint64_t now_ms) {
     struct stat st;
     if (fstat(file_fd, &st) < 0) {
         close(file_fd);
-        arm_fixed(hc, RESPONSE_500, (uint32_t)(sizeof(RESPONSE_500) - 1), now_ms);
+        ARM_CLOSE(hc, RESPONSE_500, now_ms);
         return HTTP_IO_WANT_WRITE;
     }
 
     if (S_ISDIR(st.st_mode)) {
         close(file_fd);
         if (rel_len + 11 >= STATIC_PATH_MAX) {
-            arm_fixed(hc, RESPONSE_404, (uint32_t)(sizeof(RESPONSE_404) - 1), now_ms);
+            ARM_KEEPABLE(hc, RESPONSE_404_CLOSE, RESPONSE_404_KEEP, now_ms);
             return HTTP_IO_WANT_WRITE;
         }
         memcpy(rel + rel_len, "/index.html", 11);
@@ -247,19 +281,19 @@ int32_t static_begin(http_conn *hc, uint64_t now_ms) {
 
         file_fd = open_under_docroot(rel);
         if (file_fd < 0) {
-            arm_fixed(hc, RESPONSE_404, (uint32_t)(sizeof(RESPONSE_404) - 1), now_ms);
+            ARM_KEEPABLE(hc, RESPONSE_404_CLOSE, RESPONSE_404_KEEP, now_ms);
             return HTTP_IO_WANT_WRITE;
         }
         if (fstat(file_fd, &st) < 0) {
             close(file_fd);
-            arm_fixed(hc, RESPONSE_500, (uint32_t)(sizeof(RESPONSE_500) - 1), now_ms);
+            ARM_CLOSE(hc, RESPONSE_500, now_ms);
             return HTTP_IO_WANT_WRITE;
         }
     }
 
     if (!S_ISREG(st.st_mode) || st.st_size < 0) {
         close(file_fd);
-        arm_fixed(hc, RESPONSE_403, (uint32_t)(sizeof(RESPONSE_403) - 1), now_ms);
+        ARM_KEEPABLE(hc, RESPONSE_403_CLOSE, RESPONSE_403_KEEP, now_ms);
         return HTTP_IO_WANT_WRITE;
     }
 
@@ -267,22 +301,25 @@ int32_t static_begin(http_conn *hc, uint64_t now_ms) {
     char *hdr = bump_alloc(hc->arena, STATIC_HDR_SIZE, 1);
     if (!hdr) {
         close(file_fd);
-        arm_fixed(hc, RESPONSE_500, (uint32_t)(sizeof(RESPONSE_500) - 1), now_ms);
+        ARM_CLOSE(hc, RESPONSE_500, now_ms);
         return HTTP_IO_WANT_WRITE;
     }
+
+    hc->keep = http_should_keepalive(&hc->req);
 
     int32_t hdr_len = snprintf(hdr, STATIC_HDR_SIZE,
         "HTTP/1.1 200 OK\r\n"
         "Content-Length: %lld\r\n"
         "Content-Type: %s\r\n"
-        "Connection: close\r\n"
+        "Connection: %s\r\n"
         "\r\n",
         (long long)st.st_size,
-        mime);
+        mime,
+        hc->keep ? "keep-alive" : "close");
 
     if (hdr_len < 0 || (uint32_t)hdr_len >= STATIC_HDR_SIZE) {
         close(file_fd);
-        arm_fixed(hc, RESPONSE_500, (uint32_t)(sizeof(RESPONSE_500) - 1), now_ms);
+        ARM_CLOSE(hc, RESPONSE_500, now_ms);
         return HTTP_IO_WANT_WRITE;
     }
 

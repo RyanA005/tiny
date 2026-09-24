@@ -12,4 +12,11 @@ void log_init(void);
 void log_shutdown(void);
 void tiny_log(enum log_level level, const char *fmt, ...);
 
+/* INFO is off unless built with -DTINY_VERBOSE. */
+#ifdef TINY_VERBOSE
+#define TINY_LOG_INFO(...) tiny_log(INFO, __VA_ARGS__)
+#else
+#define TINY_LOG_INFO(...) ((void)0)
+#endif
+
 #endif

@@ -17,10 +17,10 @@
 
 /* Per-slot arena: request buf 4K + path 4K + resp hdr + padding. */
 #define SLOT_BUMP_SIZE 12288
-#define CONNS_PER_WORKER 32
-#define WORKER_COUNT 4
+#define CONNS_PER_WORKER 64
+#define WORKER_COUNT 8
 #define WORKER_EPOLL_WAIT_MS 50
-#define WORKER_EPOLL_EVENTS 64
+#define WORKER_EPOLL_EVENTS 128
 
 extern connection_queue queue;
 

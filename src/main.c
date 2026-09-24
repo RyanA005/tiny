@@ -101,9 +101,9 @@ int32_t main(int32_t argc, char **argv) {
         return 1;
     }
 
-    tiny_log(INFO, "[SYS] listening on 0.0.0.0:%d (backlog %d, queue %d)\n",
+    TINY_LOG_INFO("[SYS] listening on 0.0.0.0:%d (backlog %d, queue %d)\n",
              port, MAX_BACKLOG, CONNECTION_QUEUE_SIZE);
-    tiny_log(INFO, "[SYS] starting %d workers (%d slots x %d bump, log queue %d)\n",
+    TINY_LOG_INFO("[SYS] starting %d workers (%d slots x %d bump, log queue %d)\n",
              WORKER_COUNT, CONNS_PER_WORKER, SLOT_BUMP_SIZE, LOG_QUEUE_SIZE);
 
     for (uint32_t i = 0; i < WORKER_COUNT; i++) {
@@ -162,7 +162,7 @@ int32_t main(int32_t argc, char **argv) {
     for (uint32_t i = 0; i < WORKER_COUNT; i++) {
         pthread_join(args[i].thread, NULL);
     }
-    tiny_log(INFO, "[SYS] joined %d workers, shutting down\n", WORKER_COUNT);
+    TINY_LOG_INFO("[SYS] joined %d workers, shutting down\n", WORKER_COUNT);
     log_shutdown();
 
     return 0;

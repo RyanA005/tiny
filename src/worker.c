@@ -9,6 +9,10 @@
 #include <time.h>
 #include <sys/epoll.h>
 
+/* Sweep idle deadlines every N loops (or on epoll timeout). Avoids
+ * clock_gettime + O(slots) work on every hot event. */
+#define DEADLINE_SWEEP_EVERY 32
+
 typedef struct {
     uint8_t active;
     bump arena;
@@ -49,15 +53,33 @@ static void arm_events(int32_t epfd, worker_slot *slots, uint32_t idx, int32_t i
     epoll_ctl(epfd, EPOLL_CTL_MOD, slot->hc.conn.fd, &ev);
 }
 
-static void apply_io(int32_t epfd, worker_slot *slots, uint32_t idx, int32_t io) {
-    if (io == HTTP_IO_DONE || io == HTTP_IO_CLOSE) {
+static void apply_io(int32_t epfd, worker_slot *slots, uint32_t idx, int32_t io,
+                     uint64_t now) {
+    /* Pipelined requests can finish synchronously: DONE -> reuse -> DONE... */
+    while (io == HTTP_IO_DONE) {
+        io = http_conn_reuse(&slots[idx].hc, &slots[idx].arena, now);
+    }
+    if (io == HTTP_IO_CLOSE) {
         slot_close(epfd, &slots[idx]);
         return;
     }
     arm_events(epfd, slots, idx, io);
 }
 
-static int32_t try_accept_one(int32_t epfd, worker_slot *slots, uint32_t worker_id) {
+static void sweep_deadlines(int32_t epfd, worker_slot *slots, uint64_t now) {
+    for (uint32_t i = 0; i < CONNS_PER_WORKER; i++) {
+        if (!slots[i].active) {
+            continue;
+        }
+        if (http_conn_check_deadline(&slots[i].hc, now) == HTTP_IO_CLOSE) {
+            STAT_INC(STAT_TIMEOUT);
+            slot_close(epfd, &slots[i]);
+        }
+    }
+}
+
+static int32_t try_accept_one(int32_t epfd, worker_slot *slots, uint32_t worker_id,
+                              uint64_t now) {
     uint32_t i;
     for (i = 0; i < CONNS_PER_WORKER; i++) {
         if (!slots[i].active) {
@@ -80,11 +102,14 @@ static int32_t try_accept_one(int32_t epfd, worker_slot *slots, uint32_t worker_
 
     worker_slot *slot = &slots[i];
     bump_reset(&slot->arena);
-    memset(&slot->hc, 0, sizeof(slot->hc));
-    connection_copy_payload(&slot->hc.conn, &c);
+    /* Keep header_buf; only clear connection/request state. */
+    slot->hc.conn.fd = -1;
     slot->hc.file_fd = -1;
+    slot->hc.arena = 0;
+    slot->hc.buf = 0;
+    slot->hc.used = 0;
+    connection_copy_payload(&slot->hc.conn, &c);
 
-    uint64_t now = mono_ms();
     if (http_conn_prepare(&slot->hc, &slot->arena, now) < 0) {
         close(c.fd);
         return 1;
@@ -103,20 +128,12 @@ static int32_t try_accept_one(int32_t epfd, worker_slot *slots, uint32_t worker_
     slot->active = 1;
     STAT_INC(STAT_CONN_OPEN);
 
-    char ip_str[INET6_ADDRSTRLEN] = {0};
-    if (c.flags & 0x01) {
-        inet_ntop(AF_INET, &c.ip[0], ip_str, sizeof(ip_str));
-    } else if (c.flags & 0x02) {
-        inet_ntop(AF_INET6, &c.ip[0], ip_str, sizeof(ip_str));
-    } else {
-        snprintf(ip_str, sizeof(ip_str), "UNKNOWN");
-    }
-    tiny_log(INFO, "[WORKER %u] slot %u fd=%d %s:%u\n",
-             worker_id, i, c.fd, ip_str, c.port);
+    (void)worker_id;
+    TINY_LOG_INFO("[WORKER %u] slot %u fd=%d\n", worker_id, i, c.fd);
 
     /* Data may already be waiting in the kernel buffer. */
     int32_t io = http_conn_on_read(&slot->hc, now);
-    apply_io(epfd, slots, i, io);
+    apply_io(epfd, slots, i, io, now);
     return 1;
 }
 
@@ -125,9 +142,10 @@ void *worker(void *p) {
     worker_slot slots[CONNS_PER_WORKER];
     struct epoll_event events[WORKER_EPOLL_EVENTS];
     uint32_t active = 0;
+    uint32_t loop_i = 0;
 
-    tiny_log(INFO, "[WORKER %u] starting (slots %d, arena %d)\n",
-             args->id, CONNS_PER_WORKER, SLOT_BUMP_SIZE);
+    TINY_LOG_INFO("[WORKER %u] starting (slots %d, arena %d)\n",
+                  args->id, CONNS_PER_WORKER, SLOT_BUMP_SIZE);
 
     memset(slots, 0, sizeof(slots));
     for (uint32_t i = 0; i < CONNS_PER_WORKER; i++) {
@@ -147,7 +165,8 @@ void *worker(void *p) {
     }
 
     while (1) {
-        while (try_accept_one(epfd, slots, args->id)) {
+        uint64_t now = mono_ms();
+        while (try_accept_one(epfd, slots, args->id, now)) {
             /* fill free slots from the queue */
         }
 
@@ -158,7 +177,8 @@ void *worker(void *p) {
 
         int32_t timeout = active ? WORKER_EPOLL_WAIT_MS : 10;
         int32_t n = epoll_wait(epfd, events, WORKER_EPOLL_EVENTS, timeout);
-        uint64_t now = mono_ms();
+        now = mono_ms();
+        loop_i++;
 
         if (n < 0) {
             if (errno == EINTR) {
@@ -187,15 +207,10 @@ void *worker(void *p) {
             }
 
             int32_t io = HTTP_IO_WANT_READ;
-            if (http_conn_check_deadline(&slot->hc, now) == HTTP_IO_CLOSE) {
-                STAT_INC(STAT_TIMEOUT);
-                slot_close(epfd, slot);
-                continue;
-            }
 
             if ((ev & EPOLLIN) && slot->hc.phase == HTTP_PHASE_READ) {
                 io = http_conn_on_read(&slot->hc, now);
-                apply_io(epfd, slots, idx, io);
+                apply_io(epfd, slots, idx, io, now);
                 if (!slots[idx].active) {
                     continue;
                 }
@@ -203,20 +218,13 @@ void *worker(void *p) {
 
             if ((ev & EPOLLOUT) && slot->hc.phase != HTTP_PHASE_READ) {
                 io = http_conn_on_write(&slot->hc, now);
-                apply_io(epfd, slots, idx, io);
+                apply_io(epfd, slots, idx, io, now);
             }
         }
 
-        // Deadline sweep for idle stalls with no epoll edge.
-        now = mono_ms();
-        for (uint32_t i = 0; i < CONNS_PER_WORKER; i++) {
-            if (!slots[i].active) {
-                continue;
-            }
-            if (http_conn_check_deadline(&slots[i].hc, now) == HTTP_IO_CLOSE) {
-                STAT_INC(STAT_TIMEOUT);
-                slot_close(epfd, &slots[i]);
-            }
+        /* Idle deadline sweep: on epoll timeout, or every N busy loops. */
+        if (n == 0 || (loop_i % DEADLINE_SWEEP_EVERY) == 0) {
+            sweep_deadlines(epfd, slots, now);
         }
     }
 
@@ -225,6 +233,6 @@ void *worker(void *p) {
         free(slots[i].arena.mem);
     }
     close(epfd);
-    tiny_log(INFO, "[WORKER %u] exiting\n", args->id);
+    TINY_LOG_INFO("[WORKER %u] exiting\n", args->id);
     return NULL;
 }

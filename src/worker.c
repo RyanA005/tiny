@@ -367,6 +367,7 @@ void *tiny_worker_main(void *p) {
     close(epfd);
     munmap(events, ev_bytes);
     static_cache_clear();
+    proxy_pool_clear();
     munmap(w->free_stack, free_bytes);
     TINY_LOG_INFO("[WORKER %u] exiting\n", w->id);
     return NULL;

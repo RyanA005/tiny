@@ -247,3 +247,121 @@ high_c           431396.12     297640.94       1.45x
 - `not_found` is not cached. It moved 1.31x to 1.40x anyway; do not credit the cache for that.
 - `large` 1.05x to 0.99x. One open per connection, then the run is `sendfile`. Tied with nginx.
 - Kept. A replaced file is served from the old inode until the worker exits.
+
+---
+
+## 2026-09-29 21:52 UTC
+
+- **commit:** `4c6991b88d44529670998a65869abcf1bc039630` (`4c6991b reverse proxy implementation`)
+- **host:** WSL2 linux 6.6.87, i7-13700H, 20 CPUs. nginx `small` 250k, a bit above the previous 10s run (241k).
+- **bench:** duration 10s, threads 4. Static suite via `scripts/bench.sh --peer both`. Proxy suite is separate: one nginx origin serving `<html>bench</html>`, then tiny, nginx, and apache each proxying to it. Upstream keepalive off on all three. Apache `ProxyPass ... disablereuse=On`. nginx `proxy_pass` left at its default (HTTP/1.0, no upstream pool).
+
+### State
+
+Config file is the only CLI. `listen` plus `static / <root>` is what the static bench starts. A single primary `static /` route still skips the route table and calls `static_begin()`. Proxy is one nonblocking upstream socket per request, owned by the same worker slot. The request and the response are rewritten with `Connection: close`. No upstream pool. Open-file cache, epoll `armed_io` skip, free-slot stack, and `TCP_CORK` are unchanged.
+
+### Static comparison (Requests/sec)
+
+```
+case                  tiny         nginx        apache  tiny/nginx  tiny/apache
+------------  ------------  ------------  ------------  ----------  -----------
+small            330655.44     249634.22      46307.54       1.32x        7.14x
+small_close       75118.99      34811.71      40811.13       2.16x        1.84x
+medium           125659.30      91522.99      64017.80       1.37x        1.96x
+large             19699.40      18474.62      16145.96       1.07x        1.22x
+not_found        343596.91     235957.68     108512.30       1.46x        3.17x
+high_c           472946.00     321420.23     100384.20       1.47x        4.71x
+```
+
+### Proxy comparison (Requests/sec)
+
+Origin column is nginx serving the file directly. The other three are proxies in front of that same origin.
+
+```
+case                  tiny         nginx        apache  tiny/nginx  tiny/apache     origin
+------------  ------------  ------------  ------------  ----------  -----------  -----------
+small             33562.00      42676.78      32479.65       0.79x        1.03x    240178.32
+small_close       33171.09      31406.72      29816.69       1.06x        1.11x     37186.98
+high_c            40930.91      92417.60      47185.40       0.44x        0.87x    275479.44
+```
+
+`small` and `high_c` are 64 and 256 keepalive clients. `small_close` is 64 clients with `Connection: close`. No timeouts on the proxies. Origin `high_c` had 156 timeouts.
+
+### Notes
+
+- Static ratios are at or above the 13:40 UTC cache run (`small` 1.21x, `high_c` 1.45x, `not_found` 1.40x, `large` 0.99x). The config-file CLI did not move the static path.
+- Proxy `small` and `small_close` are the same number (34k vs 33k). nginx's are not (43k vs 31k). Tiny answers `Connection: close`, so the keepalive run never reuses the client socket. It also sends `Connection: close` upstream and `connect()`s a new socket every request.
+- At 64 connections that puts tiny next to apache and a little behind nginx. At 256 connections nginx is 2.3x tiny. nginx here is `worker_processes auto` (20). Tiny is still 6 workers. The origin itself is still ~240k, so none of the proxies are close to it.
+- Next: stop forcing `Connection: close` on the client when the response has `Content-Length` or chunked framing, and keep idle upstream sockets on the worker (fixed stack, no lock, same shape as the file cache). Responses with no length still have to close the upstream. Do not raise the worker count until those two are measured.
+
+---
+
+## 2026-09-29 22:11 UTC
+
+- **commit:** `4c6991b88d44529670998a65869abcf1bc039630` + uncommitted
+- **host:** same WSL2 i7-13700H. Origin nginx `small` 243k, in line with the 21:52 run (240k).
+- **bench:** duration 10s, threads 4. Same proxy fixture: nginx origin serving `<html>bench</html>`. Two peer setups. "no pool" matches the 21:52 entry (nginx default `proxy_pass`, Apache `disablereuse=On`). "pool" turns upstream keepalive on (nginx `keepalive 128` plus `proxy_http_version 1.1`, Apache `ProxyPass` reuse left on).
+
+### State
+
+Proxied responses keep the client connection when `http_should_keepalive` says so (GET/HEAD, no request body, client did not send `Connection: close`). The upstream request is sent with `Connection: keep-alive`. When the response has a known end and did not say `Connection: close`, the upstream fd goes on a per-worker idle stack (`PROXY_POOL_MAX` = slots per worker, no lock). A response with no length still closes that fd. A reused fd that dies before any response byte is dropped and the request is connected once more (GET/HEAD only). The client socket is `TCP_CORK`ed while the response is written, then uncorked, so the header and body leave as one segment.
+
+### No upstream pool on the peers (Requests/sec)
+
+Same peer config as the 21:52 entry. Tiny now pools. They do not.
+
+```
+case                  tiny         nginx        apache  tiny/nginx  tiny/apache
+------------  ------------  ------------  ------------  ----------  -----------
+small            100616.88      36322.56      33893.63       2.77x        2.97x
+small_close       57010.59      31420.46      30150.33       1.81x        1.89x
+high_c           188522.06      97019.25      49969.36       1.94x        3.77x
+```
+
+### Upstream keepalive on the peers (Requests/sec)
+
+```
+case                  tiny         nginx        apache  tiny/nginx  tiny/apache     origin
+------------  ------------  ------------  ------------  ----------  -----------  -----------
+small            100616.88     118121.73      59145.21       0.85x        1.70x    242517.66
+small_close       57010.59      33143.10      40795.57       1.72x        1.40x     34757.56
+high_c           188522.06     194375.69      80484.70       0.97x        2.34x    299527.24
+```
+
+Average latency, tiny vs nginx-with-pool: `small` 633us vs 594us, `high_c` 1.43ms vs 1.36ms. Close-case timeouts: tiny 62, origin 60, nginx-pool 37, apache-pool 50. No timeouts on the keepalive proxy runs.
+
+### Notes
+
+- Against the 21:52 tiny numbers (`small` 34k, `small_close` 33k, `high_c` 41k): `small` 101k, `small_close` 57k, `high_c` 189k. `small` and `small_close` are no longer the same rate, so the client connection is actually being kept.
+- `small_close` moved because the upstream fd is reused while the client still reconnects every request. It is above the origin's own close rate (35k). The origin close run is accept-bound. Tiny's close run is not opening an upstream socket per request.
+- Fair peer is nginx with a keepalive pool: 0.85x at 64 connections, 0.97x at 256. nginx is still `worker_processes auto` (20) and Tiny is still 6 workers. Apache with backend reuse is well behind (1.70x and 2.34x).
+- Origin direct is 243k / 300k. The extra hop is still a userspace copy. Worker count stays at 6 until that gap is the thing being measured.
+
+---
+
+## 2026-09-29 22:22 UTC
+
+- **commit:** `4c6991b88d44529670998a65869abcf1bc039630` + uncommitted
+- **host:** same WSL2 i7-13700H.
+- **bench:** duration 10s, threads 4. Same `<html>bench</html>` origin. Peer is nginx with `keepalive 128` and `proxy_http_version 1.1`, the fair setup from the 22:11 entry.
+
+### State
+
+The upstream socket is added to epoll only when a read or write returns `EAGAIN`. A request that finishes inline does not `epoll_ctl` at all. A GET with no body is one `send` upstream, with no cork. When the response body is already in the shuttle buffer, header and body go out in one `sendmsg`, and the client is not corked. A response that is still arriving keeps `TCP_CORK` until `proxy_done`.
+
+### Comparison (Requests/sec)
+
+```
+case                  tiny         nginx   tiny/nginx
+------------  ------------  ------------  ----------
+small            123877.37     117520.53       1.05x
+small_close       57412.93      33723.18       1.70x
+high_c           199266.79     194357.18       1.03x
+```
+
+Average latency: `small` 505us vs 596us, `small_close` 762us vs 1.42ms, `high_c` 1.43ms vs 1.35ms. Timeouts: tiny `high_c` 103, nginx `high_c` 210. None on the 64-connection runs.
+
+### Notes
+
+- Against the 22:11 tiny numbers (`small` 101k, `small_close` 57k, `high_c` 189k) and that run's nginx-with-pool (118k / 33k / 194k). `small` 101k to 124k and is now ahead of nginx (0.85x to 1.05x). `high_c` 189k to 199k (0.97x to 1.03x). `small_close` did not move. That case is still the client handshake.
+- Kept. Worker count is still 6.

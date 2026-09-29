@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 
+#include <sys/socket.h>
+
 #include "http.h"
 #include "routes.h"
 
@@ -22,17 +24,23 @@
 #define PX_RESP_EOF     0x10
 #define PX_BODY_DONE    0x20
 #define PX_RESP_SENT    0x40
+#define PX_UP_CLOSE     0x80   /* upstream response forbids reuse */
+#define PX_CLIENT_KEEP  0x100  /* client may send another request */
+#define PX_REUSED       0x200  /* fd came from the idle pool */
+#define PX_OVERREAD     0x400  /* read past the framed body; do not pool */
 
 typedef struct proxy_conn {
     int32_t fd;
     uint8_t phase;
     uint8_t armed;    /* HTTP_IO_* currently registered for fd */
     uint8_t in_epoll;
-    uint8_t flags;
     uint8_t chunk_state;
     uint8_t saw_digit;
     uint8_t cont_off; /* bytes of "100 Continue" already written */
+    uint16_t flags;
     uint16_t status;
+    socklen_t up_len;
+    struct sockaddr_storage up_addr;
     uint32_t hdr_off;
     uint32_t hdr_len;
     uint32_t buf_off;
@@ -48,6 +56,7 @@ typedef struct proxy_conn {
 
 void proxy_conn_reset(proxy_conn *px);
 void proxy_close(int epfd, proxy_conn *px);
+void proxy_pool_clear(void);
 
 int32_t proxy_begin(http_conn *hc, proxy_conn *px, const tiny_route *route,
                     int epfd, uint32_t slot_idx, uint64_t now_ms);

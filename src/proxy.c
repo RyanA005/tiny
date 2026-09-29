@@ -11,26 +11,35 @@
 #include <netinet/tcp.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 
 /*
  * Proxied slot, one worker, two sockets:
  *
  *   client fd  -- tiny slot -- upstream fd
  *
- * Both fds sit in that worker's epoll. The upstream registration sets
- * bit 31 of epoll data so the worker can tell the ends apart.
- * There is no proxy thread and no upstream pool.
+ * Both fds can sit in that worker's epoll. The upstream registration
+ * sets bit 31 of epoll data so the worker can tell the ends apart.
+ * The upstream fd is registered only when a read or write returns
+ * EAGAIN, so a request that finishes inline does not touch epoll.
+ * There is no proxy thread. Idle upstream sockets sit in a per-worker
+ * stack (no lock), the same idea as the open-file cache.
  *
- *   connect / send rewritten request
+ *   take idle upstream, or connect
+ *        -> send rewritten request (Connection: keep-alive)
  *        -> send buffered body, then unread Content-Length bytes
  *        -> read upstream headers
  *        -> send rewritten response headers
  *        -> stream the body (Content-Length, raw chunked, or until EOF)
  *
- * The original request bytes are forwarded with hop-by-hop headers
- * removed and Connection: close added. That keeps the upstream from
- * holding the socket open after one response. The client connection
- * is also closed when the response finishes.
+ * Hop-by-hop headers are stripped. The client is kept when the request
+ * allows it. The upstream socket goes back on the idle stack when the
+ * body had a known end and the response did not say Connection: close.
+ * A response with no length still closes the upstream. A reused socket
+ * that fails before any byte of this request is written is dropped and
+ * a new connect is tried once. A bodyless upstream request is one send.
+ * A response whose body is already buffered is one sendmsg. Cork stays
+ * for a request body and for a response that is still streaming.
  *
  * Backpressure is a single shuttle buffer. If it still holds bytes,
  * only the writer is armed. If it is empty, only the reader is armed.
@@ -81,6 +90,62 @@ static const char CONT_100[] = "HTTP/1.1 100 Continue\r\n\r\n";
 _Static_assert(sizeof(CONT_100) - 1 == CONT_100_LEN, "100 Continue length");
 
 static const char CONNECTION_CLOSE[] = "Connection: close\r\n\r\n";
+static const char CONNECTION_KEEP[] = "Connection: keep-alive\r\n\r\n";
+
+/* One idle upstream per slot is enough: a finished request returns its
+ * fd here, and a new request takes it. Peak fds stay one per slot. */
+#define PROXY_POOL_MAX TINY_CONNS_PER_WORKER
+
+typedef struct {
+    int32_t fd;
+    socklen_t len;
+    struct sockaddr_storage addr;
+} proxy_idle;
+
+static __thread proxy_idle proxy_pool[PROXY_POOL_MAX];
+static __thread uint32_t proxy_pool_n;
+
+static int addr_eq(const struct sockaddr_storage *a, socklen_t alen,
+                   const struct sockaddr *b, socklen_t blen) {
+    return alen == blen && alen > 0 &&
+           memcmp(a, b, (size_t)alen) == 0;
+}
+
+static int proxy_pool_take(const struct sockaddr *addr, socklen_t len) {
+    uint32_t i;
+
+    for (i = proxy_pool_n; i-- > 0;) {
+        if (addr_eq(&proxy_pool[i].addr, proxy_pool[i].len, addr, len)) {
+            int32_t fd = proxy_pool[i].fd;
+            proxy_pool[i] = proxy_pool[proxy_pool_n - 1];
+            proxy_pool_n--;
+            return fd;
+        }
+    }
+    return -1;
+}
+
+/* 1: stored. 0: caller still owns fd. */
+static int proxy_pool_put(int fd, const struct sockaddr_storage *addr, socklen_t len) {
+    if (fd < 0 || len <= 0 || proxy_pool_n >= PROXY_POOL_MAX) {
+        return 0;
+    }
+    proxy_pool[proxy_pool_n].fd = fd;
+    proxy_pool[proxy_pool_n].len = len;
+    proxy_pool[proxy_pool_n].addr = *addr;
+    proxy_pool_n++;
+    return 1;
+}
+
+void proxy_pool_clear(void) {
+    while (proxy_pool_n > 0) {
+        proxy_pool_n--;
+        if (proxy_pool[proxy_pool_n].fd >= 0) {
+            close(proxy_pool[proxy_pool_n].fd);
+        }
+        proxy_pool[proxy_pool_n].fd = -1;
+    }
+}
 
 void proxy_conn_reset(proxy_conn *px) {
     px->fd = -1;
@@ -101,6 +166,7 @@ void proxy_conn_reset(proxy_conn *px) {
     px->body_left = 0;
     px->resp_left = 0;
     px->chunk_size = 0;
+    px->up_len = 0;
 }
 
 void proxy_close(int epfd, proxy_conn *px) {
@@ -138,7 +204,7 @@ static int32_t arm_fixed(http_conn *hc, const char *resp, uint16_t status,
 }
 
 static int32_t proxy_fail(http_conn *hc, proxy_conn *px, int epfd, uint64_t now_ms) {
-    uint8_t sent = (uint8_t)(px->flags & PX_RESP_SENT);
+    uint8_t sent = (uint16_t)(px->flags & PX_RESP_SENT);
 
     proxy_close(epfd, px);
     if (sent) {
@@ -147,11 +213,123 @@ static int32_t proxy_fail(http_conn *hc, proxy_conn *px, int epfd, uint64_t now_
     return arm_fixed(hc, RESP_502, 502, now_ms);
 }
 
+static int proxy_can_pool(const proxy_conn *px) {
+    if (px->fd < 0 || px->up_len == 0) {
+        return 0;
+    }
+    if (px->flags & (PX_UP_CLOSE | PX_OVERREAD | PX_RESP_EOF)) {
+        return 0;
+    }
+    return (px->flags & PX_BODY_DONE) ? 1 : 0;
+}
+
+/* Drop epoll and cork, then park the fd. Does not touch the bytes. */
+static void proxy_release(int epfd, proxy_conn *px) {
+    int fd = px->fd;
+    struct sockaddr_storage addr = px->up_addr;
+    socklen_t len = px->up_len;
+    int off;
+
+    if (px->in_epoll && epfd >= 0) {
+        epoll_ctl(epfd, EPOLL_CTL_DEL, px->fd, NULL);
+    }
+    if (px->flags & PX_CORK) {
+        off = 0;
+        setsockopt(px->fd, IPPROTO_TCP, TCP_CORK, &off, sizeof(off));
+    }
+    proxy_conn_reset(px);
+    if (!proxy_pool_put(fd, &addr, len)) {
+        close(fd);
+    }
+}
+
+static void cork_up(proxy_conn *px, int on);
+
+/* Reused fd died before this request was written. Connect a fresh one. */
+static int proxy_reopen(proxy_conn *px, int epfd) {
+    int fd;
+    int rc;
+    int off;
+
+    if (px->fd >= 0) {
+        if (px->in_epoll && epfd >= 0) {
+            epoll_ctl(epfd, EPOLL_CTL_DEL, px->fd, NULL);
+        }
+        if (px->flags & PX_CORK) {
+            off = 0;
+            setsockopt(px->fd, IPPROTO_TCP, TCP_CORK, &off, sizeof(off));
+        }
+        close(px->fd);
+    }
+    px->fd = -1;
+    px->in_epoll = 0;
+    px->armed = 0;
+    px->flags = (uint16_t)(px->flags & ~(PX_CORK | PX_REUSED));
+    px->hdr_off = 0;
+
+    fd = socket(px->up_addr.ss_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0) {
+        return -1;
+    }
+    px->fd = fd;
+    if (px->body_off < px->body_end || px->body_left > 0) {
+        cork_up(px, 1);
+    }
+    rc = connect(fd, (struct sockaddr *)&px->up_addr, px->up_len);
+    if (rc < 0 && errno != EINPROGRESS) {
+        return -1;
+    }
+    return 0;
+}
+
+/* Idle fd accepted nothing we can trust. GET/HEAD only, and only before
+ * any response byte. 1: resent. 0: not eligible. -1: reconnect failed. */
+static int proxy_retry_idle(http_conn *hc, proxy_conn *px, int epfd) {
+    if (!(px->flags & PX_REUSED) || (px->flags & PX_RESP_SENT) || px->buf_len != 0) {
+        return 0;
+    }
+    if (hc->req.method != HTTP_METHOD_GET && hc->req.method != HTTP_METHOD_HEAD) {
+        return 0;
+    }
+    if (proxy_reopen(px, epfd) < 0) {
+        return -1;
+    }
+    px->buf_off = 0;
+    px->buf_len = 0;
+    px->phase = PX_SEND_REQ;
+    return 1;
+}
+
+static void cork_client(http_conn *hc, int on) {
+    int v = on ? 1 : 0;
+
+    if (hc->conn.fd < 0) {
+        return;
+    }
+    if (on && hc->cork_on) {
+        return;
+    }
+    if (!on && !hc->cork_on) {
+        return;
+    }
+    if (setsockopt(hc->conn.fd, IPPROTO_TCP, TCP_CORK, &v, sizeof(v)) < 0) {
+        return;
+    }
+    hc->cork_on = on ? 1 : 0;
+}
+
 static int32_t proxy_done(http_conn *hc, proxy_conn *px, int epfd) {
     uint16_t code = px->status ? px->status : 200;
+    uint8_t keep = (px->flags & PX_CLIENT_KEEP) ? 1 : 0;
 
-    proxy_close(epfd, px);
-    hc->keep = 0;
+    /* Streaming responses corked the client. A buffered response did not. */
+    cork_client(hc, 0);
+    if (proxy_can_pool(px)) {
+        proxy_release(epfd, px);
+    } else {
+        proxy_close(epfd, px);
+    }
+    hc->keep = keep;
     hc->status_code = code;
     STAT_NOTE_STATUS(code);
     return HTTP_IO_DONE;
@@ -170,9 +348,9 @@ static void cork_up(proxy_conn *px, int on) {
         return;
     }
     if (on) {
-        px->flags = (uint8_t)(px->flags | PX_CORK);
+        px->flags = (uint16_t)(px->flags | PX_CORK);
     } else {
-        px->flags = (uint8_t)(px->flags & ~PX_CORK);
+        px->flags = (uint16_t)(px->flags & ~PX_CORK);
     }
 }
 
@@ -288,8 +466,8 @@ static int rewrite_request(http_conn *hc, proxy_conn *px) {
         }
         p = eol + 2;
     }
-    if (append_bytes(px->hdr, PROXY_HDR_MAX, &len, CONNECTION_CLOSE,
-                     (uint32_t)(sizeof(CONNECTION_CLOSE) - 1)) < 0) {
+    if (append_bytes(px->hdr, PROXY_HDR_MAX, &len, CONNECTION_KEEP,
+                     (uint32_t)(sizeof(CONNECTION_KEEP) - 1)) < 0) {
         return -1;
     }
     px->hdr_off = 0;
@@ -493,16 +671,44 @@ static int value_is_chunked(const char *v, uint32_t n) {
     return n == 7 && ieq(v, "chunked", 7);
 }
 
+static int header_has_token(const char *v, uint32_t n, const char *tok, uint32_t tn) {
+    uint32_t i = 0;
+
+    while (i < n) {
+        uint32_t s;
+        uint32_t e;
+
+        while (i < n && (v[i] == ' ' || v[i] == '\t' || v[i] == ',')) {
+            i++;
+        }
+        s = i;
+        while (i < n && v[i] != ',') {
+            i++;
+        }
+        e = i;
+        while (e > s && (v[e - 1] == ' ' || v[e - 1] == '\t')) {
+            e--;
+        }
+        if (e - s == tn && ieq(v + s, tok, tn)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* 1: skip this informational block. 0: final headers are in px->hdr. -1: bad. */
-static int rewrite_response(proxy_conn *px, const char *src, uint32_t n) {
+static int rewrite_response(http_conn *hc, proxy_conn *px, const char *src, uint32_t n) {
     const char *end = src + n;
     const char *eol = find_crlf(src, end);
     const char *sp;
     const char *p;
+    const char *conn;
     unsigned code;
     uint32_t len = 0;
     int saw_cl = 0;
     int saw_te = 0;
+    int up_close = 0;
+    int up_ka = 0;
 
     if (!eol || (size_t)(eol - src) < 12) {
         return -1;
@@ -529,7 +735,7 @@ static int rewrite_response(proxy_conn *px, const char *src, uint32_t n) {
     }
 
     px->status = (uint16_t)code;
-    px->flags = (uint8_t)(px->flags & ~(PX_RESP_CL | PX_RESP_CHUNKED | PX_RESP_EOF | PX_BODY_DONE));
+    px->flags = (uint16_t)(px->flags & ~(PX_RESP_CL | PX_RESP_CHUNKED | PX_RESP_EOF | PX_BODY_DONE));
     px->resp_left = 0;
     px->chunk_state = CH_SIZE;
     px->saw_digit = 0;
@@ -572,13 +778,21 @@ static int rewrite_response(proxy_conn *px, const char *src, uint32_t n) {
             }
             saw_cl = 1;
             px->resp_left = cl;
-            px->flags = (uint8_t)(px->flags | PX_RESP_CL);
+            px->flags = (uint16_t)(px->flags | PX_RESP_CL);
         } else if (nlen == 17 && ieq(p, "transfer-encoding", 17)) {
             if (saw_te || !value_is_chunked(v, (uint32_t)(vend - v))) {
                 return -1;
             }
             saw_te = 1;
-            px->flags = (uint8_t)(px->flags | PX_RESP_CHUNKED);
+            px->flags = (uint16_t)(px->flags | PX_RESP_CHUNKED);
+        } else if (nlen == 10 && ieq(p, "connection", 10)) {
+            uint32_t vn = (uint32_t)(vend - v);
+            if (header_has_token(v, vn, "close", 5)) {
+                up_close = 1;
+            }
+            if (header_has_token(v, vn, "keep-alive", 10)) {
+                up_ka = 1;
+            }
         }
         if (!hop_by_hop(p, nlen, 0)) {
             if (append_bytes(px->hdr, PROXY_HDR_MAX, &len, p,
@@ -592,14 +806,27 @@ static int rewrite_response(proxy_conn *px, const char *src, uint32_t n) {
         return -1;
     }
     if (code == 204 || code == 304) {
-        px->flags = (uint8_t)(px->flags | PX_BODY_DONE);
+        px->flags = (uint16_t)(px->flags | PX_BODY_DONE);
     } else if (!(px->flags & PX_RESP_CL) && !(px->flags & PX_RESP_CHUNKED)) {
-        px->flags = (uint8_t)(px->flags | PX_RESP_EOF);
+        px->flags = (uint16_t)(px->flags | PX_RESP_EOF);
     } else if ((px->flags & PX_RESP_CL) && px->resp_left == 0) {
-        px->flags = (uint8_t)(px->flags | PX_BODY_DONE);
+        px->flags = (uint16_t)(px->flags | PX_BODY_DONE);
     }
-    if (append_bytes(px->hdr, PROXY_HDR_MAX, &len, CONNECTION_CLOSE,
-                     (uint32_t)(sizeof(CONNECTION_CLOSE) - 1)) < 0) {
+    /* HTTP/1.0 stays open only when the upstream asked for it. */
+    if (src[7] == '0' && !up_ka) {
+        up_close = 1;
+    }
+    if (up_close) {
+        px->flags = (uint16_t)(px->flags | PX_UP_CLOSE);
+    }
+    if (http_should_keepalive(&hc->req)) {
+        px->flags = (uint16_t)(px->flags | PX_CLIENT_KEEP);
+    }
+    conn = (px->flags & PX_CLIENT_KEEP) ? CONNECTION_KEEP : CONNECTION_CLOSE;
+    if (append_bytes(px->hdr, PROXY_HDR_MAX, &len, conn,
+                     (px->flags & PX_CLIENT_KEEP)
+                         ? (uint32_t)(sizeof(CONNECTION_KEEP) - 1)
+                         : (uint32_t)(sizeof(CONNECTION_CLOSE) - 1)) < 0) {
         return -1;
     }
     px->hdr_off = 0;
@@ -636,20 +863,22 @@ static int note_body(proxy_conn *px, uint32_t n) {
         }
         if (c < n) {
             px->buf_len = base + c;
+            px->flags = (uint16_t)(px->flags | PX_OVERREAD);
         }
         if (done) {
-            px->flags = (uint8_t)(px->flags | PX_BODY_DONE);
+            px->flags = (uint16_t)(px->flags | PX_BODY_DONE);
         }
         return 0;
     }
     if (px->flags & PX_RESP_CL) {
         if ((uint64_t)n > px->resp_left) {
+            px->flags = (uint16_t)(px->flags | PX_OVERREAD);
             px->buf_len -= n - (uint32_t)px->resp_left;
             n = (uint32_t)px->resp_left;
         }
         px->resp_left -= n;
         if (px->resp_left == 0) {
-            px->flags = (uint8_t)(px->flags | PX_BODY_DONE);
+            px->flags = (uint16_t)(px->flags | PX_BODY_DONE);
         }
     }
     return 0;
@@ -681,6 +910,57 @@ static int sock_read(int fd, char *p, uint32_t *len, uint32_t cap,
         return 0;
     }
     *len += (uint32_t)n;
+    return 0;
+}
+
+/* Header plus an already-buffered body, one sendmsg. */
+static int send_gathered(http_conn *hc, proxy_conn *px, int *again, int *dead) {
+    struct iovec iov[2];
+    struct msghdr msg;
+    uint32_t hdr_n = 0;
+    int nvec = 0;
+    ssize_t n;
+
+    *again = 0;
+    *dead = 0;
+    if (px->hdr_off < px->hdr_len) {
+        hdr_n = px->hdr_len - px->hdr_off;
+        iov[nvec].iov_base = px->hdr + px->hdr_off;
+        iov[nvec].iov_len = hdr_n;
+        nvec++;
+    }
+    if (px->buf_off < px->buf_len) {
+        iov[nvec].iov_base = px->buf + px->buf_off;
+        iov[nvec].iov_len = px->buf_len - px->buf_off;
+        nvec++;
+    }
+    if (nvec == 0) {
+        return 0;
+    }
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_iov = iov;
+    msg.msg_iovlen = (size_t)nvec;
+    do {
+        n = sendmsg(hc->conn.fd, &msg, MSG_NOSIGNAL);
+    } while (n < 0 && errno == EINTR);
+    if (n < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            *again = 1;
+            return 0;
+        }
+        *dead = 1;
+        return -1;
+    }
+    if (n == 0) {
+        *dead = 1;
+        return -1;
+    }
+    if ((uint32_t)n < hdr_n) {
+        px->hdr_off += (uint32_t)n;
+    } else {
+        px->hdr_off += hdr_n;
+        px->buf_off += (uint32_t)n - hdr_n;
+    }
     return 0;
 }
 
@@ -732,7 +1012,7 @@ static int flush_100(http_conn *hc, proxy_conn *px) {
         }
         px->cont_off = (uint8_t)(px->cont_off + (uint8_t)n);
     }
-    px->flags = (uint8_t)(px->flags & ~PX_SEND_100);
+    px->flags = (uint16_t)(px->flags & ~PX_SEND_100);
     return 0;
 }
 
@@ -806,6 +1086,14 @@ int32_t proxy_pump(http_conn *hc, proxy_conn *px, int epfd, uint32_t slot_idx,
                 before = px->hdr_off;
                 if (sock_send(px->fd, px->hdr, &px->hdr_off, px->hdr_len, &again, &dead) < 0 ||
                     dead) {
+                    /* Nothing from this request was written. The idle fd
+                     * was already dead. Drop it and connect once. */
+                    if ((px->flags & PX_REUSED) && px->hdr_off == 0) {
+                        if (proxy_reopen(px, epfd) < 0) {
+                            return proxy_fail(hc, px, epfd, now_ms);
+                        }
+                        break;
+                    }
                     return proxy_fail(hc, px, epfd, now_ms);
                 }
                 if (px->hdr_off != before) {
@@ -924,11 +1212,23 @@ int32_t proxy_pump(http_conn *hc, proxy_conn *px, int epfd, uint32_t slot_idx,
                         break;
                     }
                     if (rr < 0) {
+                        int retry = (px->buf_len == 0)
+                                        ? proxy_retry_idle(hc, px, epfd)
+                                        : 0;
+                        if (retry > 0) {
+                            break;
+                        }
                         return proxy_fail(hc, px, epfd, now_ms);
                     }
                 }
                 if (px->buf_len == before) {
                     if (eof) {
+                        int retry = (px->buf_len == 0)
+                                        ? proxy_retry_idle(hc, px, epfd)
+                                        : 0;
+                        if (retry > 0) {
+                            break;
+                        }
                         return proxy_fail(hc, px, epfd, now_ms);
                     }
                     int32_t y = yield_up(px, epfd, slot_idx, HTTP_IO_WANT_READ, HTTP_IO_IDLE);
@@ -944,7 +1244,7 @@ int32_t proxy_pump(http_conn *hc, proxy_conn *px, int epfd, uint32_t slot_idx,
                 }
             }
             total = at + 4;
-            kind = rewrite_response(px, px->buf, total);
+            kind = rewrite_response(hc, px, px->buf, total);
             if (kind < 0) {
                 return proxy_fail(hc, px, epfd, now_ms);
             }
@@ -956,10 +1256,11 @@ int32_t proxy_pump(http_conn *hc, proxy_conn *px, int epfd, uint32_t slot_idx,
                 /* 1xx block dropped. Keep reading the real response. */
                 break;
             }
-            if (hc->req.method == HTTP_METHOD_HEAD) {
-                px->flags = (uint8_t)(px->flags | PX_BODY_DONE);
-                px->buf_len = 0;
-            } else if (px->flags & PX_BODY_DONE) {
+            if (hc->req.method == HTTP_METHOD_HEAD || (px->flags & PX_BODY_DONE)) {
+                if (prefix > 0) {
+                    px->flags = (uint16_t)(px->flags | PX_OVERREAD);
+                }
+                px->flags = (uint16_t)(px->flags | PX_BODY_DONE);
                 px->buf_len = 0;
             } else if (prefix > 0 && note_body(px, prefix) < 0) {
                 return proxy_fail(hc, px, epfd, now_ms);
@@ -969,12 +1270,40 @@ int32_t proxy_pump(http_conn *hc, proxy_conn *px, int epfd, uint32_t slot_idx,
         }
 
         case PX_SEND_RESP:
+            if (px->flags & PX_BODY_DONE) {
+                uint32_t hdr_before = px->hdr_off;
+                uint32_t buf_before = px->buf_off;
+
+                if (send_gathered(hc, px, &again, &dead) < 0 || dead) {
+                    if (px->hdr_off != hdr_before || px->buf_off != buf_before) {
+                        px->flags = (uint16_t)(px->flags | PX_RESP_SENT);
+                    }
+                    if (px->flags & PX_RESP_SENT) {
+                        proxy_close(epfd, px);
+                        return HTTP_IO_CLOSE;
+                    }
+                    return proxy_fail(hc, px, epfd, now_ms);
+                }
+                if (px->hdr_off != hdr_before || px->buf_off != buf_before) {
+                    px->flags = (uint16_t)(px->flags | PX_RESP_SENT);
+                    touch(hc, now_ms);
+                    budget--;
+                }
+                if (px->hdr_off < px->hdr_len || px->buf_off < px->buf_len) {
+                    if (again) {
+                        return HTTP_IO_WANT_WRITE;
+                    }
+                    break;
+                }
+                return proxy_done(hc, px, epfd);
+            }
+            cork_client(hc, 1);
             if (px->hdr_off < px->hdr_len) {
                 before = px->hdr_off;
                 if (sock_send(hc->conn.fd, px->hdr, &px->hdr_off, px->hdr_len, &again, &dead) < 0 ||
                     dead) {
                     if (px->hdr_off > before) {
-                        px->flags = (uint8_t)(px->flags | PX_RESP_SENT);
+                        px->flags = (uint16_t)(px->flags | PX_RESP_SENT);
                     }
                     if (px->flags & PX_RESP_SENT) {
                         proxy_close(epfd, px);
@@ -983,7 +1312,7 @@ int32_t proxy_pump(http_conn *hc, proxy_conn *px, int epfd, uint32_t slot_idx,
                     return proxy_fail(hc, px, epfd, now_ms);
                 }
                 if (px->hdr_off != before) {
-                    px->flags = (uint8_t)(px->flags | PX_RESP_SENT);
+                    px->flags = (uint16_t)(px->flags | PX_RESP_SENT);
                     touch(hc, now_ms);
                     budget--;
                 }
@@ -1007,7 +1336,7 @@ int32_t proxy_pump(http_conn *hc, proxy_conn *px, int epfd, uint32_t slot_idx,
                     return HTTP_IO_CLOSE;
                 }
                 if (px->buf_off != before) {
-                    px->flags = (uint8_t)(px->flags | PX_RESP_SENT);
+                    px->flags = (uint16_t)(px->flags | PX_RESP_SENT);
                     touch(hc, now_ms);
                     budget--;
                 }
@@ -1033,7 +1362,7 @@ int32_t proxy_pump(http_conn *hc, proxy_conn *px, int epfd, uint32_t slot_idx,
                     cap = (uint32_t)px->resp_left;
                 }
                 if (cap == 0) {
-                    px->flags = (uint8_t)(px->flags | PX_BODY_DONE);
+                    px->flags = (uint16_t)(px->flags | PX_BODY_DONE);
                     return proxy_done(hc, px, epfd);
                 }
                 px->buf_off = 0;
@@ -1091,8 +1420,10 @@ int32_t proxy_begin(http_conn *hc, proxy_conn *px, const tiny_route *route,
     }
 
     proxy_conn_reset(px);
+    px->up_addr = route->upstream;
+    px->up_len = route->upstream_len;
     if (expects_continue(hc)) {
-        px->flags = (uint8_t)(px->flags | PX_SEND_100);
+        px->flags = (uint16_t)(px->flags | PX_SEND_100);
     }
 
     hdrs = hc->req.header_bytes;
@@ -1112,21 +1443,28 @@ int32_t proxy_begin(http_conn *hc, proxy_conn *px, const tiny_route *route,
         return arm_fixed(hc, RESP_502, 502, now_ms);
     }
 
-    fd = socket(route->upstream.ss_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-    if (fd < 0) {
-        return arm_fixed(hc, RESP_502, 502, now_ms);
+    fd = proxy_pool_take((struct sockaddr *)&route->upstream, route->upstream_len);
+    if (fd >= 0) {
+        px->flags = (uint16_t)(px->flags | PX_REUSED);
+    } else {
+        fd = socket(route->upstream.ss_family,
+                    SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        if (fd < 0) {
+            return arm_fixed(hc, RESP_502, 502, now_ms);
+        }
     }
     px->fd = fd;
     px->phase = PX_SEND_REQ;
-    cork_up(px, 1);
-    rc = connect(fd, (struct sockaddr *)&route->upstream, route->upstream_len);
-    if (rc < 0 && errno != EINPROGRESS) {
-        return proxy_fail(hc, px, epfd, now_ms);
+    if (px->body_off < px->body_end || px->body_left > 0) {
+        cork_up(px, 1);
+    }
+    if (!(px->flags & PX_REUSED)) {
+        rc = connect(fd, (struct sockaddr *)&route->upstream, route->upstream_len);
+        if (rc < 0 && errno != EINPROGRESS) {
+            return proxy_fail(hc, px, epfd, now_ms);
+        }
     }
     hc->keep = 0;
     hc->deadline_ms = now_ms + hc->send_timeout_ms;
-    if (arm_up(px, epfd, slot_idx, HTTP_IO_WANT_WRITE) < 0) {
-        return proxy_fail(hc, px, epfd, now_ms);
-    }
     return proxy_pump(hc, px, epfd, slot_idx, now_ms);
 }

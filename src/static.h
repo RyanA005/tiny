@@ -5,8 +5,15 @@
 
 #include "http.h"
 
+typedef struct {
+    uint8_t allow_dotfiles; /* serve segments like .well-known (not . / ..) */
+    uint8_t allow_symlinks; /* drop RESOLVE_NO_SYMLINKS; keep BENEATH */
+} static_policy;
+
 int32_t static_init(const char *docroot);
 void static_shutdown(void);
+void static_set_policy(static_policy policy);
+static_policy static_get_policy(void);
 
 /*
  * Open/stat/build headers for a finished request. Fast: no waiting on the

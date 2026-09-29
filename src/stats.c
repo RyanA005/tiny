@@ -13,22 +13,6 @@ void tiny_stats_stub(void) {}
 #include "logger.h"
 
 static uint64_t g_counts[STAT_COUNT];
-static const char *g_names[STAT_COUNT] = {
-    [STAT_ACCEPT]        = "accept",
-    [STAT_QUEUE_DROP]    = "queue_drop",
-    [STAT_CONN_OPEN]     = "conn_open",
-    [STAT_CONN_CLOSE]    = "conn_close",
-    [STAT_REQ_OK]        = "req_ok",
-    [STAT_REQ_ERR]       = "req_err",
-    [STAT_TIMEOUT]       = "timeout",
-    [STAT_EAGAIN_READ]   = "eagain_read",
-    [STAT_EAGAIN_WRITE]  = "eagain_write",
-    [STAT_NS_READ]       = "ns_read",
-    [STAT_NS_BEGIN]      = "ns_begin",
-    [STAT_NS_WRITE_HDR]  = "ns_write_hdr",
-    [STAT_NS_SENDFILE]   = "ns_sendfile",
-    [STAT_NS_TOTAL]      = "ns_total",
-};
 
 void stats_init(void) {
     memset(g_counts, 0, sizeof(g_counts));
@@ -37,6 +21,19 @@ void stats_init(void) {
 void stats_add(uint32_t id, uint64_t n) {
     if (id < STAT_COUNT) {
         __atomic_fetch_add(&g_counts[id], n, __ATOMIC_RELAXED);
+    }
+}
+
+void stats_note_status(uint16_t code) {
+    STAT_INC(STAT_RESP_TOTAL);
+    if (code >= 200 && code < 300) {
+        STAT_INC(STAT_RESP_2XX);
+    } else if (code >= 300 && code < 400) {
+        STAT_INC(STAT_RESP_3XX);
+    } else if (code >= 400 && code < 500) {
+        STAT_INC(STAT_RESP_4XX);
+    } else if (code >= 500 && code < 600) {
+        STAT_INC(STAT_RESP_5XX);
     }
 }
 
@@ -59,27 +56,29 @@ void stats_dump(void) {
         snap[i] = __atomic_load_n(&g_counts[i], __ATOMIC_RELAXED);
     }
 
-    uint64_t ok = snap[STAT_REQ_OK];
     tiny_log(INFO, "[STATS] ---- begin ----\n");
     tiny_log(INFO, "[STATS] accept=%llu drop=%llu open=%llu close=%llu\n",
              (unsigned long long)snap[STAT_ACCEPT],
              (unsigned long long)snap[STAT_QUEUE_DROP],
              (unsigned long long)snap[STAT_CONN_OPEN],
              (unsigned long long)snap[STAT_CONN_CLOSE]);
-    tiny_log(INFO, "[STATS] req_ok=%llu req_err=%llu timeout=%llu eagain_r=%llu eagain_w=%llu\n",
-             (unsigned long long)snap[STAT_REQ_OK],
-             (unsigned long long)snap[STAT_REQ_ERR],
+    tiny_log(INFO, "[STATS] resp total=%llu 2xx=%llu 3xx=%llu 4xx=%llu 5xx=%llu\n",
+             (unsigned long long)snap[STAT_RESP_TOTAL],
+             (unsigned long long)snap[STAT_RESP_2XX],
+             (unsigned long long)snap[STAT_RESP_3XX],
+             (unsigned long long)snap[STAT_RESP_4XX],
+             (unsigned long long)snap[STAT_RESP_5XX]);
+    tiny_log(INFO, "[STATS] timeout=%llu eagain_r=%llu eagain_w=%llu\n",
              (unsigned long long)snap[STAT_TIMEOUT],
              (unsigned long long)snap[STAT_EAGAIN_READ],
              (unsigned long long)snap[STAT_EAGAIN_WRITE]);
     tiny_log(INFO, "[STATS] avg_us read=%.1f begin=%.1f write_hdr=%.1f sendfile=%.1f total=%.1f\n",
-             avg_ns(snap[STAT_NS_READ], ok) / 1000.0,
-             avg_ns(snap[STAT_NS_BEGIN], ok) / 1000.0,
-             avg_ns(snap[STAT_NS_WRITE_HDR], ok) / 1000.0,
-             avg_ns(snap[STAT_NS_SENDFILE], ok) / 1000.0,
-             avg_ns(snap[STAT_NS_TOTAL], ok) / 1000.0);
+             avg_ns(snap[STAT_NS_READ], snap[STAT_NS_READ_N]) / 1000.0,
+             avg_ns(snap[STAT_NS_BEGIN], snap[STAT_NS_BEGIN_N]) / 1000.0,
+             avg_ns(snap[STAT_NS_WRITE_HDR], snap[STAT_NS_WRITE_HDR_N]) / 1000.0,
+             avg_ns(snap[STAT_NS_SENDFILE], snap[STAT_NS_SENDFILE_N]) / 1000.0,
+             avg_ns(snap[STAT_NS_TOTAL], snap[STAT_NS_TOTAL_N]) / 1000.0);
     tiny_log(INFO, "[STATS] ---- end ----\n");
-    (void)g_names;
 }
 
 #endif

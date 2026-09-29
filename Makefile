@@ -6,9 +6,10 @@ DURATION ?= 5s
 THREADS  ?= 4
 PEER     ?= both
 SERVER_SRC = src/main.c src/allocator.c src/connection.c src/http.c src/http_parser.c \
-	src/static.c src/stats.c src/logger.c src/worker.c
+	src/static.c src/stats.c src/logger.c src/worker.c src/runtime.c
 SERVER_HDR = src/allocator.h src/connection.h src/http.h src/static.h src/stats.h \
-	src/logger.h src/worker.h
+	src/logger.h src/worker.h src/config.h src/runtime.h
+
 
 .PHONY: all clean bench perf server-stats
 

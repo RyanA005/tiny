@@ -1,16 +1,13 @@
 #ifndef HTTP_H
 #define HTTP_H
 
+#include <stddef.h>
 #include <stdint.h>
 #include <sys/types.h>
 
+#include "config.h"
 #include "connection.h"
 #include "allocator.h"
-
-#define HTTP_HEADER_BUF_SIZE 4096
-#define HTTP_READ_DEADLINE_MS 10000
-#define HTTP_SEND_DEADLINE_MS 30000
-#define HTTP_KEEPALIVE_IDLE_MS 15000
 
 #define HTTP_PARSE_BAD         -1
 #define HTTP_PARSE_INCOMPLETE  -2
@@ -21,11 +18,10 @@
 #define HTTP_FLAG_TRANSFER_ENCODING     0x04
 #define HTTP_FLAG_CONTENT_LENGTH        0x08
 
-/* Nonblocking conn progress for the worker epoll loop. */
-#define HTTP_IO_DONE        0  /* response finished; reuse or close via keep */
+#define HTTP_IO_DONE        0
 #define HTTP_IO_WANT_READ   1
 #define HTTP_IO_WANT_WRITE  2
-#define HTTP_IO_CLOSE       3  /* error / peer gone; close slot */
+#define HTTP_IO_CLOSE       3
 
 #define HTTP_PHASE_READ        0
 #define HTTP_PHASE_WRITE_FIXED 1
@@ -62,19 +58,33 @@ typedef struct {
     uint8_t flags;
 } http_request;
 
+/*
+ * Hot fields are packed at the front. header_buf is the tail so a short
+ * request (404, small file) touches metadata and the first header bytes
+ * without jumping over a multi-kilobyte hole.
+ */
 typedef struct http_conn {
     connection conn;
     bump *arena;
 
-    /* Owned header buffer (survives bump_reset / reuse). */
-    char header_buf[HTTP_HEADER_BUF_SIZE];
     char *buf;
     uint32_t used;
+    uint32_t header_cap;
+    uint32_t read_timeout_ms;
+    uint32_t send_timeout_ms;
+    uint32_t keepalive_ms;
+
     http_request req;
 
     uint8_t phase;
+    uint8_t send_body;
+    uint8_t cork_on;
+    uint8_t keep;
+    uint16_t status_code;
+
     uint64_t deadline_ms;
     uint64_t last_active_ms;
+    uint64_t t_start_ns;
 
     const char *fixed;
     uint32_t fixed_len;
@@ -87,36 +97,23 @@ typedef struct http_conn {
     int32_t file_fd;
     off_t file_size;
     off_t file_off;
-    uint8_t send_body;
-    uint8_t cork_on;
-    uint8_t keep; /* 1 = reuse fd after this response */
-    uint64_t t_start_ns;
+
+    char header_buf[TINY_HEADER_SIZE];
 } http_conn;
+
+_Static_assert(offsetof(http_conn, header_buf) + TINY_HEADER_SIZE == sizeof(http_conn),
+               "header_buf must be the tail of http_conn");
 
 int32_t http_parse_request(const char *buf, uint32_t len, http_request *req);
 uint8_t http_get_header(const char *buf, const http_request *req, const char *name,
                         uint16_t name_len, http_slice *value);
 
-/* Bind arena + allocate request buffer. Call after bump_reset. */
 int32_t http_conn_prepare(http_conn *hc, bump *arena, uint64_t now_ms);
-
-/* Readable / writable event handlers. */
 int32_t http_conn_on_read(http_conn *hc, uint64_t now_ms);
 int32_t http_conn_on_write(http_conn *hc, uint64_t now_ms);
-
-/*
- * After HTTP_IO_DONE: if hc->keep, memmove leftovers in-place, reset
- * per-request state (no full memset / buf realloc), and arm the next
- * request. Else CLOSE.
- */
 int32_t http_conn_reuse(http_conn *hc, bump *arena, uint64_t now_ms);
-
-/* Returns HTTP_IO_CLOSE if past deadline. */
 int32_t http_conn_check_deadline(http_conn *hc, uint64_t now_ms);
-
 void http_conn_cleanup(http_conn *hc);
-
-/* Decide keep-alive from the parsed request (GET/HEAD, no body). */
 uint8_t http_should_keepalive(const http_request *req);
 
 #endif

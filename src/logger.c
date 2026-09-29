@@ -5,6 +5,7 @@
 #include <stdarg.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <sched.h>
 
 #define LOG_FLUSH_EVERY 32
 
@@ -24,19 +25,29 @@ typedef struct {
 static log_queue logs = { 0 };
 static pthread_t logger_thread;
 static uint8_t logger_run = 1;
+static uint8_t logger_started = 0;
 
 static uint8_t enqueue_log(log_entry l);
 static uint8_t dequeue_log(log_entry *l);
 static void *logger(void *p);
 
-void log_init(void) {
+int32_t log_init(void) {
     logger_run = 1;
-    pthread_create(&logger_thread, NULL, logger, NULL);
+    logger_started = 0;
+    if (pthread_create(&logger_thread, NULL, logger, NULL) != 0) {
+        return -1;
+    }
+    logger_started = 1;
+    return 0;
 }
 
 void log_shutdown(void) {
+    if (!logger_started) {
+        return;
+    }
     __atomic_store_n(&logger_run, 0, __ATOMIC_RELEASE);
     pthread_join(logger_thread, NULL);
+    logger_started = 0;
 }
 
 void tiny_log(enum log_level level, const char *fmt, ...) {
@@ -117,7 +128,20 @@ static uint8_t dequeue_log(log_entry *l) {
         return 0;
     }
     log_entry *slot = &logs.data[current_head_id & (LOG_QUEUE_SIZE - 1)];
-    while (!__atomic_load_n(&slot->ready, __ATOMIC_ACQUIRE)) {}
+
+    /* Producer may be between CAS and ready=1; wait briefly, then back off. */
+    for (uint32_t spins = 0; !__atomic_load_n(&slot->ready, __ATOMIC_ACQUIRE); spins++) {
+        if (spins < 64) {
+            sched_yield();
+        } else {
+            usleep(100);
+            spins = 0;
+            if (!__atomic_load_n(&logger_run, __ATOMIC_ACQUIRE) &&
+                !__atomic_load_n(&slot->ready, __ATOMIC_ACQUIRE)) {
+                return 0;
+            }
+        }
+    }
 
     l->level = slot->level;
     l->len = slot->len;

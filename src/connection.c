@@ -1,8 +1,5 @@
 #include "connection.h"
 
-#include <sys/socket.h>
-#include <sys/time.h>
-
 void connection_copy_payload(connection *dst, const connection *src) {
     dst->accept_time = src->accept_time;
     dst->ip[0] = src->ip[0];
@@ -12,16 +9,9 @@ void connection_copy_payload(connection *dst, const connection *src) {
     dst->flags = src->flags;
 }
 
-void connection_set_timeouts(int32_t fd) {
-    struct timeval rcv = { .tv_sec = CONN_RECV_TIMEOUT_SEC, .tv_usec = 0 };
-    struct timeval snd = { .tv_sec = CONN_SEND_TIMEOUT_SEC, .tv_usec = 0 };
-
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rcv, sizeof(rcv));
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &snd, sizeof(snd));
-}
-
 uint8_t enqueue_connection(connection_queue *q, connection c) {
-    connection *slot = &q->data[q->tail_id & (CONNECTION_QUEUE_SIZE - 1)];
+    uint32_t mask = q->capacity - 1;
+    connection *slot = &q->data[q->tail_id & mask];
 
     if (__atomic_load_n(&slot->ready, __ATOMIC_ACQUIRE)) {
         if (c.fd >= 0) {
@@ -37,10 +27,11 @@ uint8_t enqueue_connection(connection_queue *q, connection c) {
 }
 
 uint8_t dequeue_connection(connection_queue *q, connection *c) {
+    uint32_t mask = q->capacity - 1;
     uint64_t pos = __atomic_load_n(&q->head_id, __ATOMIC_RELAXED);
 
     while (1) {
-        connection *slot = &q->data[pos & (CONNECTION_QUEUE_SIZE - 1)];
+        connection *slot = &q->data[pos & mask];
 
         if (!__atomic_load_n(&slot->ready, __ATOMIC_ACQUIRE)) {
             uint64_t head = __atomic_load_n(&q->head_id, __ATOMIC_RELAXED);

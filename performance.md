@@ -74,3 +74,34 @@ high_c           414144.27     284311.85     104016.68       1.46x        3.98x
 - Ahead of nginx on every case at 30s; `not_found` flipped 0.40x -> 1.47x.
 - medium also up (1.06x -> 1.29x). eventfd wake is the likely driver for both.
 - Socket timeouts still present under sustained load on all three servers.
+
+---
+
+## 2026-09-29 12:54 UTC
+
+- **commit:** `f9662d9ef466486997907ab523dbe280a8bea2b0` (`f9662d9 accept4, SIGUSR1 handling, URL decode, wake on accept`) + uncommitted (compile-time `config.h`, 6 workers x 128 slots, header buffer at end of `http_conn`)
+- **host:** WSL2 linux 6.6.87 on 13th Gen i7-13700H. lscpu: 20 logical CPUs, 10 cores, 2 threads/core, 1 socket (hypervisor flattens the 6P+8E layout). Battery, other tabs closed. Load at start 0.99 (15-min average still 13 from earlier work).
+- **bench:** duration 30s, threads 4, peer both
+
+### State
+
+Compiled constants in `src/config.h`. CLI is `./server <port> <root>` only. Shared eventfd wakes every worker on accept. `TINY_WORKERS` 6 (the chip's performance-core count) and `TINY_CONNS_PER_WORKER` 128 (768 slots, so the 256-connection case does not fill the server). Header buffer is the tail of `http_conn` at 4096 bytes. Still no open-file cache.
+
+### Comparison (Requests/sec)
+
+```
+case                  tiny         nginx        apache  tiny/nginx  tiny/apache
+------------  ------------  ------------  ------------  ----------  -----------
+small            293287.60     258089.78      64778.38       1.14x        4.53x
+small_close       76852.79      34567.86      41386.54       2.22x        1.86x
+medium           128161.16      98400.07      64639.86       1.30x        1.98x
+large             17715.25      16843.21      14260.44       1.05x        1.24x
+not_found        360807.58     240374.30     110816.68       1.50x        3.26x
+high_c           401139.50     291456.70      99668.28       1.38x        4.02x
+```
+
+### Notes
+
+- Ahead of nginx on every case. Large-file transfer was 17.30 GB / 30s (nginx 16.45 GB), closer to the wall-power runs (~19-20 GB) than the busier battery runs (~10 GB).
+- 6 workers restored keepalive (`small` 1.14x, `high_c` 1.38x) after 4 workers had dropped those to 0.61x and 1.03x. `small_close` stayed ahead (2.22x) because the accept wake is 6 threads, not 8.
+- Socket timeouts still present under sustained load on all three servers.

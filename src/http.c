@@ -49,13 +49,24 @@ uint8_t http_should_keepalive(const http_request *req) {
 }
 
 static void arm_fixed_close(http_conn *hc, const char *resp, uint32_t len,
-                            uint64_t now_ms) {
+                            uint16_t status, uint64_t now_ms) {
     hc->fixed = resp;
     hc->fixed_len = len;
     hc->fixed_off = 0;
     hc->phase = HTTP_PHASE_WRITE_FIXED;
-    hc->deadline_ms = now_ms + HTTP_SEND_DEADLINE_MS;
+    hc->deadline_ms = now_ms + hc->send_timeout_ms;
     hc->keep = 0;
+    hc->status_code = status;
+}
+
+static void note_response_done(http_conn *hc) {
+    STAT_NOTE_STATUS(hc->status_code);
+#ifdef TINY_STATS
+    if (hc->t_start_ns) {
+        STAT_ADD(STAT_NS_TOTAL, stats_now_ns() - hc->t_start_ns);
+        STAT_INC(STAT_NS_TOTAL_N);
+    }
+#endif
 }
 
 static int32_t write_fixed(http_conn *hc) {
@@ -81,11 +92,20 @@ static int32_t write_fixed(http_conn *hc) {
 
 static int32_t dispatch_parsed(http_conn *hc, int32_t result, uint64_t now_ms) {
     if (result == HTTP_PARSE_BAD) {
-        arm_fixed_close(hc, RESPONSE_400, (uint32_t)(sizeof(RESPONSE_400) - 1), now_ms);
+        arm_fixed_close(hc, RESPONSE_400, (uint32_t)(sizeof(RESPONSE_400) - 1),
+                        400, now_ms);
         return http_conn_on_write(hc, now_ms);
     }
     if (result == HTTP_PARSE_UNSUPPORTED) {
-        arm_fixed_close(hc, RESPONSE_501, (uint32_t)(sizeof(RESPONSE_501) - 1), now_ms);
+        arm_fixed_close(hc, RESPONSE_501, (uint32_t)(sizeof(RESPONSE_501) - 1),
+                        501, now_ms);
+        return http_conn_on_write(hc, now_ms);
+    }
+
+    /* Unknown method token that parsed as a method: 501, not 405. */
+    if (hc->req.method == HTTP_METHOD_UNKNOWN) {
+        arm_fixed_close(hc, RESPONSE_501, (uint32_t)(sizeof(RESPONSE_501) - 1),
+                        501, now_ms);
         return http_conn_on_write(hc, now_ms);
     }
 
@@ -109,8 +129,9 @@ static int32_t try_parse_buffer(http_conn *hc, uint64_t now_ms) {
 
     int32_t result = http_parse_request(hc->buf, hc->used, &hc->req);
     if (result == HTTP_PARSE_INCOMPLETE) {
-        if (hc->used >= HTTP_HEADER_BUF_SIZE) {
-            arm_fixed_close(hc, RESPONSE_431, (uint32_t)(sizeof(RESPONSE_431) - 1), now_ms);
+        if (hc->used >= hc->header_cap) {
+            arm_fixed_close(hc, RESPONSE_431, (uint32_t)(sizeof(RESPONSE_431) - 1),
+                            431, now_ms);
             return http_conn_on_write(hc, now_ms);
         }
         return HTTP_IO_WANT_READ;
@@ -135,6 +156,7 @@ static void reset_request_state(http_conn *hc, uint64_t now_ms, uint64_t idle_ms
     hc->send_body = 0;
     hc->cork_on = 0;
     hc->keep = 0;
+    hc->status_code = 0;
 #ifdef TINY_STATS
     hc->t_start_ns = stats_now_ns();
 #else
@@ -146,7 +168,11 @@ int32_t http_conn_prepare(http_conn *hc, bump *arena, uint64_t now_ms) {
     hc->arena = arena;
     hc->buf = hc->header_buf;
     hc->used = 0;
-    reset_request_state(hc, now_ms, HTTP_READ_DEADLINE_MS);
+    hc->header_cap = TINY_HEADER_SIZE;
+    hc->read_timeout_ms = TINY_READ_TIMEOUT_MS;
+    hc->send_timeout_ms = TINY_SEND_TIMEOUT_MS;
+    hc->keepalive_ms = TINY_KEEPALIVE_MS;
+    reset_request_state(hc, now_ms, hc->read_timeout_ms);
     return 0;
 }
 
@@ -181,7 +207,7 @@ int32_t http_conn_reuse(http_conn *hc, bump *arena, uint64_t now_ms) {
     }
 
     uint32_t left = hc->used - consumed;
-    if (left > HTTP_HEADER_BUF_SIZE) {
+    if (left > hc->header_cap) {
         return HTTP_IO_CLOSE;
     }
 
@@ -196,12 +222,12 @@ int32_t http_conn_reuse(http_conn *hc, bump *arena, uint64_t now_ms) {
 
     bump_reset(arena);
     hc->arena = arena;
-    reset_request_state(hc, now_ms, HTTP_KEEPALIVE_IDLE_MS);
+    reset_request_state(hc, now_ms, hc->keepalive_ms);
 
     /* Pipelined bytes may already form a complete next request. */
     STAT_TIME_BEGIN(read);
     int32_t rc = try_parse_buffer(hc, now_ms);
-    STAT_TIME_END(STAT_NS_READ, read);
+    STAT_TIME_END(STAT_NS_READ, STAT_NS_READ_N, read);
     return rc;
 }
 
@@ -220,28 +246,28 @@ int32_t http_conn_on_read(http_conn *hc, uint64_t now_ms) {
     if (hc->used > 0) {
         int32_t rc = try_parse_buffer(hc, now_ms);
         if (rc != HTTP_IO_WANT_READ) {
-            STAT_TIME_END(STAT_NS_READ, read);
+            STAT_TIME_END(STAT_NS_READ, STAT_NS_READ_N, read);
             return rc;
         }
     }
 
-    while (hc->used < HTTP_HEADER_BUF_SIZE) {
+    while (hc->used < hc->header_cap) {
         ssize_t n = read(hc->conn.fd, hc->buf + hc->used,
-                         HTTP_HEADER_BUF_SIZE - hc->used);
+                         hc->header_cap - hc->used);
         if (n < 0) {
             if (errno == EINTR) {
                 continue;
             }
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 STAT_INC(STAT_EAGAIN_READ);
-                STAT_TIME_END(STAT_NS_READ, read);
+                STAT_TIME_END(STAT_NS_READ, STAT_NS_READ_N, read);
                 return HTTP_IO_WANT_READ;
             }
-            STAT_TIME_END(STAT_NS_READ, read);
+            STAT_TIME_END(STAT_NS_READ, STAT_NS_READ_N, read);
             return HTTP_IO_CLOSE;
         }
         if (n == 0) {
-            STAT_TIME_END(STAT_NS_READ, read);
+            STAT_TIME_END(STAT_NS_READ, STAT_NS_READ_N, read);
             /* Idle peer closed between keep-alive requests. */
             return HTTP_IO_CLOSE;
         }
@@ -251,13 +277,14 @@ int32_t http_conn_on_read(http_conn *hc, uint64_t now_ms) {
 
         int32_t rc = try_parse_buffer(hc, now_ms);
         if (rc != HTTP_IO_WANT_READ) {
-            STAT_TIME_END(STAT_NS_READ, read);
+            STAT_TIME_END(STAT_NS_READ, STAT_NS_READ_N, read);
             return rc;
         }
     }
 
-    STAT_TIME_END(STAT_NS_READ, read);
-    arm_fixed_close(hc, RESPONSE_431, (uint32_t)(sizeof(RESPONSE_431) - 1), now_ms);
+    STAT_TIME_END(STAT_NS_READ, STAT_NS_READ_N, read);
+    arm_fixed_close(hc, RESPONSE_431, (uint32_t)(sizeof(RESPONSE_431) - 1),
+                    431, now_ms);
     return http_conn_on_write(hc, now_ms);
 }
 
@@ -273,12 +300,7 @@ int32_t http_conn_on_write(http_conn *hc, uint64_t now_ms) {
         if (rc == HTTP_IO_WANT_WRITE) {
             STAT_INC(STAT_EAGAIN_WRITE);
         } else if (rc == HTTP_IO_DONE) {
-            STAT_INC(STAT_REQ_OK);
-#ifdef TINY_STATS
-            if (hc->t_start_ns) {
-                STAT_ADD(STAT_NS_TOTAL, stats_now_ns() - hc->t_start_ns);
-            }
-#endif
+            note_response_done(hc);
         }
         return rc;
     }

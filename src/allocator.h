@@ -10,7 +10,8 @@ typedef struct {
   uint8_t* mem;
 } bump;
 
-void *bump_init(bump *b, uint64_t size);
+/* Bind a bump to caller-owned memory (no malloc). */
+void bump_bind(bump *b, void *mem, uint64_t size);
 void *bump_alloc(bump *b, uint64_t size, uint64_t alignment);
 void bump_reset(bump *b);
 

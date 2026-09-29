@@ -1,18 +1,13 @@
 #include "allocator.h"
 
-void *bump_init(bump *b, uint64_t size) {
+void bump_bind(bump *b, void *mem, uint64_t size) {
     b->offset = 0;
     b->size = size;
-    b->mem = malloc(size);
-    if (!b->mem) {
-        b->size = 0;
-        return 0;
-    }
-    return b->mem;
+    b->mem = (uint8_t *)mem;
 }
 
 void *bump_alloc(bump *b, uint64_t size, uint64_t alignment) {
-    if (alignment == 0 || (alignment & (alignment - 1)) != 0) {
+    if (!b->mem || alignment == 0 || (alignment & (alignment - 1)) != 0) {
         return 0;
     }
 

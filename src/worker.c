@@ -1,38 +1,18 @@
 #define _GNU_SOURCE
 
-#include "worker.h"
+#include "runtime.h"
 #include "stats.h"
+#include "logger.h"
 
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 #include <sys/epoll.h>
-#include <sys/eventfd.h>
+#include <sys/mman.h>
 
-/* Sweep idle deadlines every N loops (or on epoll timeout). Avoids
- * clock_gettime + O(slots) work on every hot event. */
 #define DEADLINE_SWEEP_EVERY 32
-
-int32_t worker_wake_fds[WORKER_COUNT];
-static uint32_t wake_rr;
-
-typedef struct {
-    uint8_t active;
-    bump arena;
-    http_conn hc;
-} worker_slot;
-
-void worker_notify(void) {
-    uint32_t i = __atomic_fetch_add(&wake_rr, 1, __ATOMIC_RELAXED) % WORKER_COUNT;
-    int32_t fd = worker_wake_fds[i];
-    if (fd < 0) {
-        return;
-    }
-    uint64_t one = 1;
-    ssize_t n = write(fd, &one, sizeof(one));
-    (void)n; /* EAGAIN: counter saturated; worker already has pending wake */
-}
 
 static uint64_t mono_ms(void) {
     struct timespec ts;
@@ -40,7 +20,7 @@ static uint64_t mono_ms(void) {
     return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
 }
 
-static void slot_close(int32_t epfd, worker_slot *slot) {
+static void slot_close(int32_t epfd, tiny_slot *slot, uint32_t *nactive) {
     if (!slot->active) {
         return;
     }
@@ -51,11 +31,15 @@ static void slot_close(int32_t epfd, worker_slot *slot) {
         slot->hc.conn.fd = -1;
     }
     slot->active = 0;
+    if (*nactive > 0) {
+        (*nactive)--;
+    }
     STAT_INC(STAT_CONN_CLOSE);
 }
 
-static void arm_events(int32_t epfd, worker_slot *slots, uint32_t idx, int32_t io) {
-    worker_slot *slot = &slots[idx];
+static void arm_events(int32_t epfd, tiny_slot *slots, uint32_t idx, int32_t io,
+                        uint32_t *nactive) {
+    tiny_slot *slot = &slots[idx];
     struct epoll_event ev;
     memset(&ev, 0, sizeof(ev));
     ev.data.u32 = idx;
@@ -65,64 +49,74 @@ static void arm_events(int32_t epfd, worker_slot *slots, uint32_t idx, int32_t i
     } else if (io == HTTP_IO_WANT_WRITE) {
         ev.events |= EPOLLOUT;
     }
-    epoll_ctl(epfd, EPOLL_CTL_MOD, slot->hc.conn.fd, &ev);
+    if (epoll_ctl(epfd, EPOLL_CTL_MOD, slot->hc.conn.fd, &ev) < 0) {
+        tiny_log(WARNING, "[WORKER] epoll MOD fd=%d failed: %s\n",
+                 slot->hc.conn.fd, strerror(errno));
+        slot_close(epfd, slot, nactive);
+    }
 }
 
-static void apply_io(int32_t epfd, worker_slot *slots, uint32_t idx, int32_t io,
-                     uint64_t now) {
-    /* Pipelined requests can finish synchronously: DONE -> reuse -> DONE... */
+static void apply_io(int32_t epfd, tiny_slot *slots, uint32_t idx, int32_t io,
+                     uint64_t now, uint32_t *nactive) {
     while (io == HTTP_IO_DONE) {
         io = http_conn_reuse(&slots[idx].hc, &slots[idx].arena, now);
     }
     if (io == HTTP_IO_CLOSE) {
-        slot_close(epfd, &slots[idx]);
+        slot_close(epfd, &slots[idx], nactive);
         return;
     }
-    arm_events(epfd, slots, idx, io);
+    if (!slots[idx].active) {
+        return;
+    }
+    arm_events(epfd, slots, idx, io, nactive);
 }
 
-static void sweep_deadlines(int32_t epfd, worker_slot *slots, uint64_t now) {
-    for (uint32_t i = 0; i < CONNS_PER_WORKER; i++) {
+static void sweep_deadlines(int32_t epfd, tiny_slot *slots, uint32_t nslots,
+                            uint64_t now, uint32_t *nactive) {
+    for (uint32_t i = 0; i < nslots; i++) {
         if (!slots[i].active) {
             continue;
         }
         if (http_conn_check_deadline(&slots[i].hc, now) == HTTP_IO_CLOSE) {
             STAT_INC(STAT_TIMEOUT);
-            slot_close(epfd, &slots[i]);
+            slot_close(epfd, &slots[i], nactive);
         }
     }
 }
 
-static int32_t try_accept_one(int32_t epfd, worker_slot *slots, uint32_t worker_id,
-                              uint64_t now) {
+static int32_t try_accept_one(tiny_worker *w, int32_t epfd, uint64_t now,
+                              uint32_t *nactive) {
+    tiny_runtime *rt = w->rt;
+    tiny_slot *slots = w->slots;
+    uint32_t nslots = w->slot_count;
     uint32_t i;
-    for (i = 0; i < CONNS_PER_WORKER; i++) {
+
+    for (i = 0; i < nslots; i++) {
         if (!slots[i].active) {
             break;
         }
     }
-    if (i >= CONNS_PER_WORKER) {
+    if (i >= nslots) {
         return 0;
     }
 
     connection c = { 0 };
-    if (!dequeue_connection(&queue, &c)) {
+    if (!dequeue_connection(&rt->queue, &c)) {
         return 0;
     }
     if (c.fd < 0) {
         return 1;
     }
 
-    /* Drop connections that aged out waiting for a worker slot. */
-    if (now > c.accept_time && (now - c.accept_time) > CONN_QUEUE_MAX_AGE_MS) {
+    if (now > c.accept_time &&
+        (now - c.accept_time) > TINY_QUEUE_TIMEOUT_MS) {
         close(c.fd);
         STAT_INC(STAT_TIMEOUT);
         return 1;
     }
 
-    worker_slot *slot = &slots[i];
+    tiny_slot *slot = &slots[i];
     bump_reset(&slot->arena);
-    /* Keep header_buf; only clear connection/request state. */
     slot->hc.conn.fd = -1;
     slot->hc.file_fd = -1;
     slot->hc.arena = 0;
@@ -146,14 +140,12 @@ static int32_t try_accept_one(int32_t epfd, worker_slot *slots, uint32_t worker_
     }
 
     slot->active = 1;
+    (*nactive)++;
     STAT_INC(STAT_CONN_OPEN);
+    TINY_LOG_INFO("[WORKER %u] slot %u fd=%d\n", w->id, i, c.fd);
 
-    (void)worker_id;
-    TINY_LOG_INFO("[WORKER %u] slot %u fd=%d\n", worker_id, i, c.fd);
-
-    /* Data may already be waiting in the kernel buffer. */
     int32_t io = http_conn_on_read(&slot->hc, now);
-    apply_io(epfd, slots, i, io, now);
+    apply_io(epfd, slots, i, io, now, nactive);
     return 1;
 }
 
@@ -163,65 +155,69 @@ static void drain_wake(int32_t wake_fd) {
         if (errno == EINTR) {
             continue;
         }
-        break; /* EAGAIN: drained */
+        break;
     }
 }
 
-void *worker(void *p) {
-    worker_args *args = (worker_args *)p;
-    worker_slot slots[CONNS_PER_WORKER];
-    struct epoll_event events[WORKER_EPOLL_EVENTS];
-    uint32_t active = 0;
+void *tiny_worker_main(void *p) {
+    tiny_worker *w = (tiny_worker *)p;
+    tiny_runtime *rt = w->rt;
+    tiny_slot *slots = w->slots;
+    uint32_t nslots = w->slot_count;
+    struct epoll_event *events;
+    uint32_t nactive = 0;
     uint32_t loop_i = 0;
-    int32_t wake_fd = args->wake_fd;
+    int32_t wake_fd = rt->wake_fd;
+    size_t ev_bytes;
 
-    TINY_LOG_INFO("[WORKER %u] starting (slots %d, arena %d)\n",
-                  args->id, CONNS_PER_WORKER, SLOT_BUMP_SIZE);
+    TINY_LOG_INFO("[WORKER %u] starting (slots %u, bump %d)\n",
+                  w->id, nslots, TINY_BUMP_SIZE);
 
-    memset(slots, 0, sizeof(slots));
-    for (uint32_t i = 0; i < CONNS_PER_WORKER; i++) {
-        if (!bump_init(&slots[i].arena, SLOT_BUMP_SIZE)) {
-            tiny_log(ERROR, "[WORKER %u] slot %u bump failed\n", args->id, i);
-            return NULL;
-        }
-        slots[i].hc.file_fd = -1;
-        slots[i].hc.conn.fd = -1;
+    if (tiny_size_mul(TINY_EPOLL_EVENTS_MAX, sizeof(struct epoll_event), &ev_bytes) < 0) {
+        __atomic_store_n(&w->status, -1, __ATOMIC_RELEASE);
+        return NULL;
+    }
+    events = mmap(NULL, ev_bytes, PROT_READ | PROT_WRITE,
+                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (events == MAP_FAILED) {
+        tiny_log(ERROR, "[WORKER %u] mmap events failed\n", w->id);
+        __atomic_store_n(&w->status, -1, __ATOMIC_RELEASE);
+        return NULL;
     }
 
     int32_t epfd = epoll_create1(EPOLL_CLOEXEC);
     if (epfd < 0) {
         tiny_log(ERROR, "[WORKER %u] epoll_create1 failed: %s\n",
-                 args->id, strerror(errno));
+                 w->id, strerror(errno));
+        munmap(events, ev_bytes);
+        __atomic_store_n(&w->status, -1, __ATOMIC_RELEASE);
         return NULL;
     }
 
     {
         struct epoll_event ev;
         memset(&ev, 0, sizeof(ev));
-        ev.data.u32 = WORKER_WAKE_IDX;
+        ev.data.u32 = TINY_WORKER_WAKE_IDX;
         ev.events = EPOLLIN;
         if (epoll_ctl(epfd, EPOLL_CTL_ADD, wake_fd, &ev) < 0) {
             tiny_log(ERROR, "[WORKER %u] epoll add wake_fd failed: %s\n",
-                     args->id, strerror(errno));
+                     w->id, strerror(errno));
             close(epfd);
+            munmap(events, ev_bytes);
+            __atomic_store_n(&w->status, -1, __ATOMIC_RELEASE);
             return NULL;
         }
     }
 
-    while (1) {
+    __atomic_store_n(&w->status, 1, __ATOMIC_RELEASE);
+
+    while (!__atomic_load_n(&rt->stop, __ATOMIC_ACQUIRE)) {
         uint64_t now = mono_ms();
-        while (try_accept_one(epfd, slots, args->id, now)) {
-            /* fill free slots from the queue */
+        while (try_accept_one(w, epfd, now, &nactive)) {
         }
 
-        active = 0;
-        for (uint32_t i = 0; i < CONNS_PER_WORKER; i++) {
-            active += slots[i].active;
-        }
-
-        /* Idle workers sleep until eventfd wake; busy ones use deadline timeout. */
-        int32_t timeout = active ? WORKER_EPOLL_WAIT_MS : -1;
-        int32_t n = epoll_wait(epfd, events, WORKER_EPOLL_EVENTS, timeout);
+        int32_t timeout = nactive ? TINY_EPOLL_WAIT_MS : -1;
+        int32_t n = epoll_wait(epfd, events, TINY_EPOLL_EVENTS_MAX, timeout);
         now = mono_ms();
         loop_i++;
 
@@ -230,58 +226,54 @@ void *worker(void *p) {
                 continue;
             }
             tiny_log(ERROR, "[WORKER %u] epoll_wait failed: %s\n",
-                     args->id, strerror(errno));
+                     w->id, strerror(errno));
             break;
         }
 
         for (int32_t ei = 0; ei < n; ei++) {
             uint32_t idx = events[ei].data.u32;
-            if (idx == WORKER_WAKE_IDX) {
+            if (idx == TINY_WORKER_WAKE_IDX) {
                 drain_wake(wake_fd);
                 continue;
             }
-            if (idx >= CONNS_PER_WORKER || !slots[idx].active) {
+            if (idx >= nslots || !slots[idx].active) {
                 continue;
             }
 
-            worker_slot *slot = &slots[idx];
+            tiny_slot *slot = &slots[idx];
             uint32_t ev = events[ei].events;
 
             if (ev & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
-                /* Still try to drain a readable hangup if possible. */
                 if (!(ev & EPOLLIN) && !(ev & EPOLLOUT)) {
-                    slot_close(epfd, slot);
+                    slot_close(epfd, slot, &nactive);
                     continue;
                 }
             }
 
-            int32_t io = HTTP_IO_WANT_READ;
-
             if ((ev & EPOLLIN) && slot->hc.phase == HTTP_PHASE_READ) {
-                io = http_conn_on_read(&slot->hc, now);
-                apply_io(epfd, slots, idx, io, now);
+                int32_t io = http_conn_on_read(&slot->hc, now);
+                apply_io(epfd, slots, idx, io, now, &nactive);
                 if (!slots[idx].active) {
                     continue;
                 }
             }
 
             if ((ev & EPOLLOUT) && slot->hc.phase != HTTP_PHASE_READ) {
-                io = http_conn_on_write(&slot->hc, now);
-                apply_io(epfd, slots, idx, io, now);
+                int32_t io = http_conn_on_write(&slot->hc, now);
+                apply_io(epfd, slots, idx, io, now, &nactive);
             }
         }
 
-        /* Idle deadline sweep: on epoll timeout, or every N busy loops. */
         if (n == 0 || (loop_i % DEADLINE_SWEEP_EVERY) == 0) {
-            sweep_deadlines(epfd, slots, now);
+            sweep_deadlines(epfd, slots, nslots, now, &nactive);
         }
     }
 
-    for (uint32_t i = 0; i < CONNS_PER_WORKER; i++) {
-        slot_close(epfd, &slots[i]);
-        free(slots[i].arena.mem);
+    for (uint32_t i = 0; i < nslots; i++) {
+        slot_close(epfd, &slots[i], &nactive);
     }
     close(epfd);
-    TINY_LOG_INFO("[WORKER %u] exiting\n", args->id);
+    munmap(events, ev_bytes);
+    TINY_LOG_INFO("[WORKER %u] exiting\n", w->id);
     return NULL;
 }

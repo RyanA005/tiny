@@ -123,6 +123,72 @@ static void parse_connection(const char *p, const char *end, uint8_t *flags) {
     }
 }
 
+static int32_t parse_request_target(const char *buf, const char *target,
+                                    const char *sp2, http_request *req) {
+    const char *path_start = 0;
+    const char *end = sp2;
+
+    if (target[0] == '/') {
+        path_start = target; /* origin-form */
+    } else if ((end - target) >= 7 && ascii_ieq(target, "http://", 7)) {
+        const char *auth = target + 7;
+        const char *slash = memchr(auth, '/', (size_t)(end - auth));
+        if (!slash) {
+            /* http://host  -> path "/" */
+            path_start = 0;
+        } else {
+            path_start = slash;
+        }
+    } else if ((end - target) >= 8 && ascii_ieq(target, "https://", 8)) {
+        const char *auth = target + 8;
+        const char *slash = memchr(auth, '/', (size_t)(end - auth));
+        if (!slash) {
+            path_start = 0;
+        } else {
+            path_start = slash;
+        }
+    } else {
+        return HTTP_PARSE_BAD;
+    }
+
+    const char *path;
+    const char *path_end;
+    if (!path_start) {
+        /* Absolute-form with no path: equivalent to "/". */
+        req->target.off = (uint16_t)(target - buf);
+        req->target.len = (uint16_t)(end - target);
+        req->path.off = 0;
+        req->path.len = 0; /* sentinel: treat as "/" in static_begin */
+        return 0;
+    }
+
+    path = path_start;
+    path_end = end;
+
+    const char *qmark = 0;
+    for (const char *q = path; q < path_end; q++) {
+        uint8_t c = (uint8_t)*q;
+        if (!is_target_char(c)) {
+            return HTTP_PARSE_BAD;
+        }
+        if (c == '?' && !qmark) {
+            qmark = q;
+        }
+    }
+
+    req->target.off = (uint16_t)(target - buf);
+    req->target.len = (uint16_t)(end - target);
+    req->path.off = (uint16_t)(path - buf);
+    if (qmark) {
+        req->path.len = (uint16_t)(qmark - path);
+        req->query.off = (uint16_t)(qmark + 1 - buf);
+        req->query.len = (uint16_t)(path_end - (qmark + 1));
+    } else {
+        req->path.len = (uint16_t)(path_end - path);
+    }
+    return 0;
+}
+
 static int32_t parse_request_line(const char *buf, const char *line,
                                   const char *eol, http_request *req) {
     const char *sp1 = memchr(line, ' ', (size_t)(eol - line));
@@ -138,30 +204,13 @@ static int32_t parse_request_line(const char *buf, const char *line,
 
     const char *target = sp1 + 1;
     const char *sp2 = memchr(target, ' ', (size_t)(eol - target));
-    if (!sp2 || sp2 == target || target[0] != '/') {
+    if (!sp2 || sp2 == target) {
         return HTTP_PARSE_BAD;
     }
 
-    const char *qmark = 0;
-    for (const char *q = target; q < sp2; q++) {
-        uint8_t c = (uint8_t)*q;
-        if (!is_target_char(c)) {
-            return HTTP_PARSE_BAD;
-        }
-        if (c == '?' && !qmark) {
-            qmark = q;
-        }
-    }
-
-    req->target.off = (uint16_t)(target - buf);
-    req->target.len = (uint16_t)(sp2 - target);
-    req->path.off = req->target.off;
-    if (qmark) {
-        req->path.len = (uint16_t)(qmark - target);
-        req->query.off = (uint16_t)(qmark + 1 - buf);
-        req->query.len = (uint16_t)(sp2 - (qmark + 1));
-    } else {
-        req->path.len = req->target.len;
+    int32_t trc = parse_request_target(buf, target, sp2, req);
+    if (trc) {
+        return trc;
     }
 
     const char *ver = sp2 + 1;
@@ -178,6 +227,64 @@ static int32_t parse_request_line(const char *buf, const char *line,
     return 0;
 }
 
+/* RFC 9110 Host: uri-host [ ":" port ]. Reject empty / CTL / spaces. */
+static int32_t validate_host(const char *p, uint32_t len) {
+    if (len == 0) {
+        return HTTP_PARSE_BAD;
+    }
+    for (uint32_t i = 0; i < len; i++) {
+        uint8_t c = (uint8_t)p[i];
+        if (c < 0x21 || c > 0x7E) {
+            return HTTP_PARSE_BAD;
+        }
+    }
+    /* IPv6 literal: [addr] or [addr]:port */
+    if (p[0] == '[') {
+        const char *rb = memchr(p, ']', len);
+        if (!rb || rb == p + 1) {
+            return HTTP_PARSE_BAD;
+        }
+        uint32_t after = (uint32_t)(p + len - (rb + 1));
+        if (after == 0) {
+            return 0;
+        }
+        if (rb[1] != ':' || after < 2) {
+            return HTTP_PARSE_BAD;
+        }
+        for (const char *q = rb + 2; q < p + len; q++) {
+            if (*q < '0' || *q > '9') {
+                return HTTP_PARSE_BAD;
+            }
+        }
+        return 0;
+    }
+    /* hostname / IPv4 with optional :port — digits-only port if colon present */
+    const char *colon = memchr(p, ':', len);
+    uint32_t host_len = colon ? (uint32_t)(colon - p) : len;
+    if (host_len == 0) {
+        return HTTP_PARSE_BAD;
+    }
+    for (uint32_t i = 0; i < host_len; i++) {
+        uint8_t c = (uint8_t)p[i];
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '.' || c == '-') {
+            continue;
+        }
+        return HTTP_PARSE_BAD;
+    }
+    if (colon) {
+        if (colon + 1 >= p + len) {
+            return HTTP_PARSE_BAD;
+        }
+        for (const char *q = colon + 1; q < p + len; q++) {
+            if (*q < '0' || *q > '9') {
+                return HTTP_PARSE_BAD;
+            }
+        }
+    }
+    return 0;
+}
+
 static int32_t handle_header(const char *buf, const char *name, uint32_t name_len, const char *val, const char *val_end, http_request *req, uint8_t *seen) {
     uint32_t val_len = (uint32_t)(val_end - val);
 
@@ -186,6 +293,9 @@ static int32_t handle_header(const char *buf, const char *name, uint32_t name_le
             return HTTP_PARSE_BAD;
         }
         *seen |= SEEN_HOST;
+        if (validate_host(val, val_len) != 0) {
+            return HTTP_PARSE_BAD;
+        }
         req->host.off = (uint16_t)(val - buf);
         req->host.len = (uint16_t)val_len;
     } else if (name_len == 14 && ascii_ieq(name, "content-length", 14)) {

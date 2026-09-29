@@ -9,6 +9,7 @@
 #include "connection.h"
 #include "http.h"
 #include "allocator.h"
+#include "proxy.h"
 
 #define TINY_WORKER_WAKE_IDX 0xffffffffu
 
@@ -16,9 +17,11 @@ typedef struct tiny_runtime tiny_runtime;
 
 typedef struct {
     uint8_t active;
-    uint8_t armed_io; /* HTTP_IO_WANT_READ or HTTP_IO_WANT_WRITE; 0 if unarmed */
+    uint8_t armed_io; /* HTTP_IO_* for the client socket; 0 if unarmed */
+    uint8_t proxying; /* 1 while px.fd is live. Hot path reads this, not px. */
     bump arena;
     http_conn hc;
+    proxy_conn px; /* buffers sit after hc so static requests do not touch them */
 } tiny_slot;
 
 typedef struct {
@@ -58,7 +61,7 @@ struct tiny_runtime {
     volatile sig_atomic_t stats_pending;
 };
 
-int tiny_runtime_init(tiny_runtime *rt, const char *root, uint16_t port);
+int tiny_runtime_init(tiny_runtime *rt, const tiny_site *site);
 int tiny_run(tiny_runtime *rt);
 void tiny_runtime_destroy(tiny_runtime *rt);
 

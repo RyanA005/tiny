@@ -4,6 +4,8 @@
 #include "stats.h"
 #include "logger.h"
 #include "static.h"
+#include "routes.h"
+#include "proxy.h"
 
 #include <errno.h>
 #include <stdlib.h>
@@ -14,6 +16,17 @@
 #include <sys/mman.h>
 
 #define DEADLINE_SWEEP_EVERY 32
+
+/*
+ * epoll data.u32:
+ *   0xffffffff             wake eventfd (checked before the mask below)
+ *   bit 31 clear           client socket of that slot
+ *   bit 31 set             upstream socket of that slot
+ * One worker epoll owns both ends. There is no proxy thread.
+ */
+#define EP_UPSTREAM 0x80000000u
+
+_Static_assert(TINY_CONNS_PER_WORKER < EP_UPSTREAM, "slot index uses 31 bits");
 
 static uint64_t mono_ms(void) {
     struct timespec ts;
@@ -38,6 +51,8 @@ static void slot_close(tiny_worker *w, int32_t epfd, uint32_t idx, uint32_t *nac
     if (!slot->active) {
         return;
     }
+    proxy_close(epfd, &slot->px);
+    slot->proxying = 0;
     http_conn_cleanup(&slot->hc);
     if (slot->hc.conn.fd >= 0) {
         epoll_ctl(epfd, EPOLL_CTL_DEL, slot->hc.conn.fd, 0);
@@ -67,6 +82,9 @@ static void arm_events(tiny_worker *w, int32_t epfd, uint32_t idx, int32_t io,
         ev.events |= EPOLLIN;
     } else if (io == HTTP_IO_WANT_WRITE) {
         ev.events |= EPOLLOUT;
+    } else if (io != HTTP_IO_IDLE) {
+        slot_close(w, epfd, idx, nactive);
+        return;
     }
     if (epoll_ctl(epfd, EPOLL_CTL_MOD, slot->hc.conn.fd, &ev) < 0) {
         tiny_log(WARNING, "[WORKER] epoll MOD fd=%d failed: %s\n",
@@ -143,6 +161,8 @@ static int32_t try_accept_one(tiny_worker *w, int32_t epfd, uint64_t now,
     bump_reset(&slot->arena);
     slot->hc.conn.fd = -1;
     slot->hc.file_fd = -1;
+    slot->px.fd = -1;
+    slot->proxying = 0;
     slot->hc.arena = 0;
     slot->hc.buf = 0;
     slot->hc.used = 0;
@@ -171,6 +191,7 @@ static int32_t try_accept_one(tiny_worker *w, int32_t epfd, uint64_t now,
     STAT_INC(STAT_CONN_OPEN);
     TINY_LOG_INFO("[WORKER %u] slot %u fd=%d\n", w->id, i, c.fd);
 
+    route_bind(epfd, slot, i);
     int32_t io = http_conn_on_read(&slot->hc, now);
     apply_io(w, epfd, i, io, now, nactive);
     return 1;
@@ -281,17 +302,37 @@ void *tiny_worker_main(void *p) {
         }
 
         for (int32_t ei = 0; ei < n; ei++) {
-            uint32_t idx = events[ei].data.u32;
-            if (idx == TINY_WORKER_WAKE_IDX) {
+            uint32_t packed = events[ei].data.u32;
+            uint32_t upstream_ev;
+            uint32_t idx;
+            if (packed == TINY_WORKER_WAKE_IDX) {
                 drain_wake(wake_fd);
                 continue;
             }
+            upstream_ev = packed & EP_UPSTREAM;
+            idx = packed & ~EP_UPSTREAM;
             if (idx >= nslots || !slots[idx].active) {
                 continue;
             }
 
             tiny_slot *slot = &slots[idx];
             uint32_t ev = events[ei].events;
+
+            /* Proxied slot: either socket wakes the same state machine.
+             * proxying is beside active so a static event does not load px. */
+            if (upstream_ev || slot->proxying) {
+                if (!upstream_ev &&
+                    (ev & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) &&
+                    !(ev & EPOLLIN) && !(ev & EPOLLOUT)) {
+                    slot_close(w, epfd, idx, &nactive);
+                    continue;
+                }
+                route_bind(epfd, slot, idx);
+                int32_t io = proxy_pump(&slot->hc, &slot->px, epfd, idx, now);
+                slot->proxying = slot->px.fd >= 0;
+                apply_io(w, epfd, idx, io, now, &nactive);
+                continue;
+            }
 
             if (ev & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
                 if (!(ev & EPOLLIN) && !(ev & EPOLLOUT)) {
@@ -300,6 +341,7 @@ void *tiny_worker_main(void *p) {
                 }
             }
 
+            route_bind(epfd, slot, idx);
             if ((ev & EPOLLIN) && slot->hc.phase == HTTP_PHASE_READ) {
                 int32_t io = http_conn_on_read(&slot->hc, now);
                 apply_io(w, epfd, idx, io, now, &nactive);

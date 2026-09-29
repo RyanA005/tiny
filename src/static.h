@@ -26,6 +26,20 @@ static_policy static_get_policy(void);
  */
 int32_t static_begin(http_conn *hc, uint64_t now_ms);
 
+/*
+ * Serve url (a path beginning with '/') from dir_fd.
+ * redir is the original request path, used if a directory needs a slash.
+ * Does not use the open-file cache. That cache is keyed for the single
+ * process docroot only, so the static hot path stays unchanged.
+ */
+int32_t static_begin_at(http_conn *hc, int32_t dir_fd,
+                        const char *url, uint16_t url_len,
+                        const char *redir, uint16_t redir_len,
+                        uint64_t now_ms);
+
+/* Serve one regular file. path is a filesystem path, not a URL. */
+int32_t static_begin_file(http_conn *hc, const char *path, uint64_t now_ms);
+
 /* Continue nonblocking header / sendfile progress. */
 int32_t static_on_write(http_conn *hc, uint64_t now_ms);
 

@@ -22,6 +22,9 @@
 #define HTTP_IO_WANT_READ   1
 #define HTTP_IO_WANT_WRITE  2
 #define HTTP_IO_CLOSE       3
+/* Socket stays registered for errors only. Used when a proxied slot is
+ * waiting on the other fd. */
+#define HTTP_IO_IDLE        4
 
 #define HTTP_PHASE_READ        0
 #define HTTP_PHASE_WRITE_FIXED 1

@@ -222,7 +222,12 @@ run_cases_against() {
 
 start_tiny() {
   local port="$1"
-  local cmd=("$TINY_BIN" "$port" "$DOCROOT")
+  local conf="$DOCROOT/tiny.conf"
+  cat >"$conf" <<EOF
+listen $port
+static / $DOCROOT
+EOF
+  local cmd=("$TINY_BIN" "$conf")
   if [[ "$PERF" -eq 1 ]]; then
     if ! command -v perf >/dev/null 2>&1; then
       echo "perf not found; install linux-tools" >&2

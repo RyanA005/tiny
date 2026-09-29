@@ -42,8 +42,9 @@ void tiny_runtime_notify(tiny_runtime *rt) {
 }
 
 static int check_nofile(void) {
+    /* client + upstream + cached file, per slot */
     uint64_t need =
-        (uint64_t)TINY_WORKERS * (uint64_t)TINY_CONNS_PER_WORKER * 2ull +
+        (uint64_t)TINY_WORKERS * (uint64_t)TINY_CONNS_PER_WORKER * 3ull +
         (uint64_t)TINY_QUEUE_SIZE +
         (uint64_t)TINY_WORKERS * 2ull +
         64ull;
@@ -166,10 +167,15 @@ static void on_stats_signal_rt(int sig) {
     }
 }
 
-int tiny_runtime_init(tiny_runtime *rt, const char *root, uint16_t port) {
+int tiny_runtime_init(tiny_runtime *rt, const tiny_site *site) {
+    const char *docroot;
+
     memset(rt, 0, sizeof(*rt));
-    rt->root = root;
-    rt->port = port;
+    if (!site) {
+        return -1;
+    }
+    rt->port = site->port;
+    rt->root = "";
     rt->listen_fd = -1;
     rt->wake_fd = -1;
     rt->root_fd = -1;
@@ -223,6 +229,7 @@ int tiny_runtime_init(tiny_runtime *rt, const char *root, uint16_t port) {
                       TINY_BUMP_SIZE);
             slot->hc.file_fd = -1;
             slot->hc.conn.fd = -1;
+            proxy_conn_reset(&slot->px);
             slot->active = 0;
         }
     }
@@ -235,11 +242,12 @@ int tiny_runtime_init(tiny_runtime *rt, const char *root, uint16_t port) {
         static_set_policy(pol);
     }
 
-    if (static_init(rt->root) < 0) {
+    if (routes_init(site) < 0) {
         tiny_runtime_destroy(rt);
         return -1;
     }
-    /* static_init opens root; track via static module. root_fd left -1 here. */
+    docroot = routes_docroot();
+    rt->root = docroot[0] ? docroot : "(none)";
 
     rt->wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if (rt->wake_fd < 0) {
@@ -279,7 +287,7 @@ void tiny_runtime_destroy(tiny_runtime *rt) {
         rt->wake_fd = -1;
     }
 
-    static_shutdown();
+    routes_shutdown();
 
     munmap_pool(rt->queue.data, rt->queue_bytes);
     munmap_pool(rt->bump_pool, rt->bump_bytes);

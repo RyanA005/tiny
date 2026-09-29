@@ -1,4 +1,5 @@
 #include "http.h"
+#include "routes.h"
 #include "static.h"
 #include "stats.h"
 
@@ -109,9 +110,14 @@ static int32_t dispatch_parsed(http_conn *hc, int32_t result, uint64_t now_ms) {
         return http_conn_on_write(hc, now_ms);
     }
 
-    /* result >= 0 means header_bytes; request fully parsed. */
-    int32_t rc = static_begin(hc, now_ms);
-    if (rc == HTTP_IO_WANT_WRITE) {
+    /*
+     * result >= 0 means header_bytes. Route, then let a static or fixed
+     * response try to write immediately. A proxy can also return
+     * WANT_WRITE while phase is still READ (client socket backpressure).
+     * That must not enter the static writer.
+     */
+    int32_t rc = route_begin(hc, now_ms);
+    if (rc == HTTP_IO_WANT_WRITE && hc->phase != HTTP_PHASE_READ) {
         return http_conn_on_write(hc, now_ms);
     }
     return rc;

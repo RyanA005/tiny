@@ -385,7 +385,7 @@ static int32_t arm_dir_redirect(http_conn *hc, const char *path, uint16_t path_l
     return HTTP_IO_WANT_WRITE;
 }
 
-static int32_t open_under_docroot(const char *rel) {
+static int32_t open_under(int32_t dirfd, const char *rel) {
     struct open_how how;
     memset(&how, 0, sizeof(how));
     how.flags = (uint64_t)(O_RDONLY | O_CLOEXEC);
@@ -397,12 +397,16 @@ static int32_t open_under_docroot(const char *rel) {
     }
 
     for (int32_t i = 0; i < OPENAT2_EAGAIN_RETRIES; i++) {
-        int32_t fd = (int32_t)syscall(SYS_openat2, docroot_fd, rel, &how, sizeof(how));
+        int32_t fd = (int32_t)syscall(SYS_openat2, dirfd, rel, &how, sizeof(how));
         if (fd >= 0 || errno != EAGAIN) {
             return fd;
         }
     }
     return -1;
+}
+
+static int32_t open_under_docroot(const char *rel) {
+    return open_under(docroot_fd, rel);
 }
 
 static void arm_open_error(http_conn *hc, const char *rel, uint64_t now_ms) {
@@ -716,7 +720,16 @@ void static_shutdown(void) {
     }
 }
 
-int32_t static_begin(http_conn *hc, uint64_t now_ms) {
+/*
+ * use_cache is 1 only for the process docroot. Other mounts pass 0 so a
+ * relative path under a second directory cannot collide in the cache.
+ * url is decoded as the filesystem path. redir is the client-facing path
+ * used for a trailing-slash redirect.
+ */
+static inline __attribute__((always_inline)) int32_t static_serve(http_conn *hc, int32_t dir_fd, int use_cache,
+                            const char *url, uint16_t url_len,
+                            const char *redir, uint16_t redir_len,
+                            uint64_t now_ms) {
     STAT_TIME_BEGIN(begin);
 
     if (hc->req.method != HTTP_METHOD_GET && hc->req.method != HTTP_METHOD_HEAD) {
@@ -724,7 +737,7 @@ int32_t static_begin(http_conn *hc, uint64_t now_ms) {
         return HTTP_IO_WANT_WRITE;
     }
 
-    if (docroot_fd < 0) {
+    if (dir_fd < 0) {
         ARM_CLOSE(hc, RESPONSE_500, 500, now_ms);
         return HTTP_IO_WANT_WRITE;
     }
@@ -736,25 +749,10 @@ int32_t static_begin(http_conn *hc, uint64_t now_ms) {
         return HTTP_IO_WANT_WRITE;
     }
 
-    const char *loc_path;
-    uint16_t loc_len;
-    uint32_t dec_len;
-
-    if (hc->req.path.len == 0) {
-        /* Absolute-form with empty path -> "/". */
-        decoded[0] = '/';
-        decoded[1] = '\0';
-        dec_len = 1;
-        loc_path = decoded;
-        loc_len = 1;
-    } else {
-        loc_path = hc->buf + hc->req.path.off;
-        loc_len = hc->req.path.len;
-        dec_len = percent_decode(loc_path, loc_len, decoded, STATIC_PATH_MAX);
-        if (dec_len == 0) {
-            ARM_CLOSE(hc, RESPONSE_400, 400, now_ms);
-            return HTTP_IO_WANT_WRITE;
-        }
+    uint32_t dec_len = percent_decode(url, url_len, decoded, STATIC_PATH_MAX);
+    if (dec_len == 0) {
+        ARM_CLOSE(hc, RESPONSE_400, 400, now_ms);
+        return HTTP_IO_WANT_WRITE;
     }
 
     uint32_t rel_len = normalize_path(decoded, dec_len, rel, STATIC_PATH_MAX);
@@ -763,15 +761,17 @@ int32_t static_begin(http_conn *hc, uint64_t now_ms) {
         return HTTP_IO_WANT_WRITE;
     }
 
-    cached_file *hit = file_cache_find(rel, rel_len);
-    if (hit && file_cache_recheck(hit, now_ms)) {
-        file_cache_hold(hit);
-        int32_t rc = arm_regular(hc, hit->fd, hit->size, hit->mime, 0, now_ms);
-        STAT_TIME_END(STAT_NS_BEGIN, STAT_NS_BEGIN_N, begin);
-        return rc;
+    if (use_cache) {
+        cached_file *hit = file_cache_find(rel, rel_len);
+        if (hit && file_cache_recheck(hit, now_ms)) {
+            file_cache_hold(hit);
+            int32_t rc = arm_regular(hc, hit->fd, hit->size, hit->mime, 0, now_ms);
+            STAT_TIME_END(STAT_NS_BEGIN, STAT_NS_BEGIN_N, begin);
+            return rc;
+        }
     }
 
-    int32_t file_fd = open_under_docroot(rel);
+    int32_t file_fd = open_under(dir_fd, rel);
     if (file_fd < 0) {
         arm_open_error(hc, rel, now_ms);
         return HTTP_IO_WANT_WRITE;
@@ -787,7 +787,7 @@ int32_t static_begin(http_conn *hc, uint64_t now_ms) {
     if (S_ISDIR(st.st_mode)) {
         close(file_fd);
         if (decoded[dec_len - 1] != '/') {
-            return arm_dir_redirect(hc, loc_path, loc_len, now_ms);
+            return arm_dir_redirect(hc, redir, redir_len, now_ms);
         }
         if (rel_len + 11 >= STATIC_PATH_MAX) {
             ARM_KEEPABLE(hc, RESPONSE_404_CLOSE, RESPONSE_404_KEEP, 404, now_ms);
@@ -797,15 +797,17 @@ int32_t static_begin(http_conn *hc, uint64_t now_ms) {
         rel_len += 11;
         rel[rel_len] = '\0';
 
-        hit = file_cache_find(rel, rel_len);
-        if (hit && file_cache_recheck(hit, now_ms)) {
-            file_cache_hold(hit);
-            int32_t rc = arm_regular(hc, hit->fd, hit->size, hit->mime, 0, now_ms);
-            STAT_TIME_END(STAT_NS_BEGIN, STAT_NS_BEGIN_N, begin);
-            return rc;
+        if (use_cache) {
+            cached_file *hit = file_cache_find(rel, rel_len);
+            if (hit && file_cache_recheck(hit, now_ms)) {
+                file_cache_hold(hit);
+                int32_t rc = arm_regular(hc, hit->fd, hit->size, hit->mime, 0, now_ms);
+                STAT_TIME_END(STAT_NS_BEGIN, STAT_NS_BEGIN_N, begin);
+                return rc;
+            }
         }
 
-        file_fd = open_under_docroot(rel);
+        file_fd = open_under(dir_fd, rel);
         if (file_fd < 0) {
             arm_open_error(hc, rel, now_ms);
             return HTTP_IO_WANT_WRITE;
@@ -825,14 +827,75 @@ int32_t static_begin(http_conn *hc, uint64_t now_ms) {
 
     const char *mime = mime_from_path(rel, rel_len);
     uint8_t owned = 1;
-    cached_file *stored = file_cache_store(rel, rel_len, file_fd, &st, mime, now_ms);
-    if (stored) {
-        file_cache_hold(stored);
-        owned = 0;
+    if (use_cache) {
+        cached_file *stored = file_cache_store(rel, rel_len, file_fd, &st, mime, now_ms);
+        if (stored) {
+            file_cache_hold(stored);
+            owned = 0;
+        }
     }
     int32_t rc = arm_regular(hc, file_fd, st.st_size, mime, owned, now_ms);
     STAT_TIME_END(STAT_NS_BEGIN, STAT_NS_BEGIN_N, begin);
     return rc;
+}
+
+int32_t static_begin(http_conn *hc, uint64_t now_ms) {
+    const char *loc;
+    uint16_t loc_len;
+    char root_path[2];
+
+    if (hc->req.path.len == 0) {
+        /* Absolute-form with empty path -> "/". */
+        root_path[0] = '/';
+        root_path[1] = '\0';
+        loc = root_path;
+        loc_len = 1;
+    } else {
+        loc = hc->buf + hc->req.path.off;
+        loc_len = hc->req.path.len;
+    }
+    return static_serve(hc, docroot_fd, 1, loc, loc_len, loc, loc_len, now_ms);
+}
+
+int32_t static_begin_at(http_conn *hc, int32_t dir_fd,
+                        const char *url, uint16_t url_len,
+                        const char *redir, uint16_t redir_len,
+                        uint64_t now_ms) {
+    return static_serve(hc, dir_fd, 0, url, url_len, redir, redir_len, now_ms);
+}
+
+int32_t static_begin_file(http_conn *hc, const char *path, uint64_t now_ms) {
+    uint32_t plen;
+
+    if (hc->req.method != HTTP_METHOD_GET && hc->req.method != HTTP_METHOD_HEAD) {
+        ARM_KEEPABLE(hc, RESPONSE_405_CLOSE, RESPONSE_405_KEEP, 405, now_ms);
+        return HTTP_IO_WANT_WRITE;
+    }
+    if (!path || !path[0]) {
+        ARM_CLOSE(hc, RESPONSE_500, 500, now_ms);
+        return HTTP_IO_WANT_WRITE;
+    }
+
+    int32_t file_fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (file_fd < 0) {
+        arm_open_error(hc, path, now_ms);
+        return HTTP_IO_WANT_WRITE;
+    }
+
+    struct stat st;
+    if (fstat(file_fd, &st) < 0) {
+        close(file_fd);
+        ARM_CLOSE(hc, RESPONSE_500, 500, now_ms);
+        return HTTP_IO_WANT_WRITE;
+    }
+    if (!S_ISREG(st.st_mode) || st.st_size < 0) {
+        close(file_fd);
+        ARM_KEEPABLE(hc, RESPONSE_403_CLOSE, RESPONSE_403_KEEP, 403, now_ms);
+        return HTTP_IO_WANT_WRITE;
+    }
+
+    plen = (uint32_t)strlen(path);
+    return arm_regular(hc, file_fd, st.st_size, mime_from_path(path, plen), 1, now_ms);
 }
 
 int32_t static_on_write(http_conn *hc, uint64_t now_ms) {

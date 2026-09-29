@@ -1,44 +1,37 @@
 #include "logger.h"
+#include "routes.h"
 #include "runtime.h"
 #include "stats.h"
 
-#include <ctype.h>
 #include <stdio.h>
 #include <string.h>
 
 static void usage(const char *argv0) {
-    fprintf(stderr, "usage: %s <port> <root>\n", argv0);
-}
-
-static uint16_t parse_port(const char *s) {
-    unsigned long v = 0;
-    if (!s || !s[0]) {
-        return 0;
-    }
-    for (const char *p = s; *p; p++) {
-        if (!isdigit((unsigned char)*p)) {
-            return 0;
-        }
-        v = v * 10ul + (unsigned long)(*p - '0');
-        if (v > 65535ul) {
-            return 0;
-        }
-    }
-    return (uint16_t)v;
+    fprintf(stderr,
+            "usage: %s <config>\n"
+            "\n"
+            "  listen <port>\n"
+            "  static <prefix> <path>\n"
+            "  proxy  <prefix> <host:port>\n"
+            "\n"
+            "  listen 8080\n"
+            "  static / ./www\n"
+            "\n"
+            "  listen 8080\n"
+            "  proxy / localhost:3000\n",
+            argv0);
 }
 
 int main(int argc, char **argv) {
     tiny_runtime rt;
-    uint16_t port;
+    tiny_site site;
 
-    if (argc != 3) {
+    if (argc != 2) {
         usage(argv[0]);
         return 1;
     }
-
-    port = parse_port(argv[1]);
-    if (port == 0 || argv[2][0] == '\0') {
-        usage(argv[0]);
+    /* Reject a bad file before the logger or workers start. */
+    if (tiny_site_load(&site, argv[1]) < 0) {
         return 1;
     }
 
@@ -49,7 +42,7 @@ int main(int argc, char **argv) {
     stats_init();
 
     memset(&rt, 0, sizeof(rt));
-    if (tiny_runtime_init(&rt, argv[2], port) < 0) {
+    if (tiny_runtime_init(&rt, &site) < 0) {
         log_shutdown();
         return 1;
     }

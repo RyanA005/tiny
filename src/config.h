@@ -29,8 +29,8 @@
 #define TINY_EPOLL_EVENTS_MAX     128
 
 /* Filesystem policy. */
-#define TINY_ALLOW_DOTFILES       1
-#define TINY_ALLOW_SYMLINKS       0
+#define TINY_ALLOW_DOTFILES       0
+#define TINY_ALLOW_SYMLINKS       1
 
 _Static_assert(TINY_WORKERS >= 1, "TINY_WORKERS");
 _Static_assert(TINY_CONNS_PER_WORKER >= 1, "TINY_CONNS_PER_WORKER");

@@ -16,6 +16,7 @@ typedef struct tiny_runtime tiny_runtime;
 
 typedef struct {
     uint8_t active;
+    uint8_t armed_io; /* HTTP_IO_WANT_READ or HTTP_IO_WANT_WRITE; 0 if unarmed */
     bump arena;
     http_conn hc;
 } tiny_slot;
@@ -27,6 +28,8 @@ typedef struct {
     tiny_runtime *rt;
     tiny_slot *slots;
     uint32_t slot_count;
+    uint16_t *free_stack;
+    uint32_t free_top;
 } __attribute__((aligned(TINY_CACHE_LINE))) tiny_worker;
 
 _Static_assert(sizeof(tiny_worker) % TINY_CACHE_LINE == 0,

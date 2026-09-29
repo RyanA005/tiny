@@ -7,6 +7,7 @@
 #include <linux/openat2.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <stddef.h>
 #include <string.h>
 #include <stdio.h>
 #include <sys/sendfile.h>
@@ -21,6 +22,43 @@
 #define STATIC_HDR_SIZE 256
 #define STATIC_PATH_MAX 4096
 #define OPENAT2_EAGAIN_RETRIES 8
+#define FILE_CACHE_SLOTS 64
+#define FILE_CACHE_PATH 192
+#define FILE_CACHE_RECHECK_MS 1000
+#define FILE_CACHE_RETIRED 8
+
+/*
+ * Per-worker table. Metadata is one cache line; path[192] is the next three.
+ * A hit shares fd across requests (sendfile takes an explicit offset).
+ * Recheck the path at most once a second so an edit shows up without a
+ * stat on every request. fd == -1 is an empty probe stop, -2 is a tombstone.
+ */
+typedef struct {
+    uint64_t hash;
+    uint64_t checked_ms;
+    int64_t mtime_sec;
+    int64_t mtime_nsec;
+    off_t size;
+    uint64_t ino;
+    const char *mime;
+    int32_t fd;
+    uint16_t path_len;
+    uint16_t uses;
+    char path[FILE_CACHE_PATH];
+} cached_file;
+
+_Static_assert(sizeof(off_t) == 8, "off_t width");
+_Static_assert(sizeof(cached_file) == 256, "cached_file is 4 cache lines");
+_Static_assert(offsetof(cached_file, path) == 64, "path starts on the second cache line");
+
+typedef struct {
+    int32_t fd;
+    uint16_t uses;
+} retired_fd;
+
+static __thread int32_t file_cache_ready;
+static __thread cached_file file_cache[FILE_CACHE_SLOTS];
+static __thread retired_fd file_cache_retired[FILE_CACHE_RETIRED];
 
 static int32_t docroot_fd = -1;
 static static_policy g_policy = {
@@ -104,8 +142,13 @@ static void arm_fixed(http_conn *hc, const char *close_resp, uint32_t close_len,
     hc->deadline_ms = now_ms + hc->send_timeout_ms;
     hc->status_code = status;
     if (hc->file_fd >= 0) {
-        close(hc->file_fd);
+        if (hc->file_owned) {
+            close(hc->file_fd);
+        } else {
+            static_cache_release(hc->file_fd);
+        }
         hc->file_fd = -1;
+        hc->file_owned = 1;
     }
 }
 
@@ -331,8 +374,13 @@ static int32_t arm_dir_redirect(http_conn *hc, const char *path, uint16_t path_l
     hc->deadline_ms = now_ms + hc->send_timeout_ms;
     hc->status_code = 301;
     if (hc->file_fd >= 0) {
-        close(hc->file_fd);
+        if (hc->file_owned) {
+            close(hc->file_fd);
+        } else {
+            static_cache_release(hc->file_fd);
+        }
         hc->file_fd = -1;
+        hc->file_owned = 1;
     }
     return HTTP_IO_WANT_WRITE;
 }
@@ -366,6 +414,269 @@ static void arm_open_error(http_conn *hc, const char *rel, uint64_t now_ms) {
         tiny_log(WARNING, "[STATIC] open '%s' failed: %s\n", rel, strerror(errno));
         ARM_CLOSE(hc, RESPONSE_500, 500, now_ms);
     }
+}
+
+static void file_cache_init(void) {
+    if (file_cache_ready) {
+        return;
+    }
+    for (uint32_t i = 0; i < FILE_CACHE_SLOTS; i++) {
+        file_cache[i].fd = -1;
+    }
+    for (uint32_t i = 0; i < FILE_CACHE_RETIRED; i++) {
+        file_cache_retired[i].fd = -1;
+        file_cache_retired[i].uses = 0;
+    }
+    file_cache_ready = 1;
+}
+
+static void retire_fd(int32_t fd, uint16_t uses) {
+    if (fd < 0) {
+        return;
+    }
+    if (uses == 0) {
+        close(fd);
+        return;
+    }
+    for (uint32_t i = 0; i < FILE_CACHE_RETIRED; i++) {
+        if (file_cache_retired[i].fd < 0) {
+            file_cache_retired[i].fd = fd;
+            file_cache_retired[i].uses = uses;
+            return;
+        }
+    }
+    /* In-flight sends still hold fd. Dropping it here would break them. */
+}
+
+static void tombstone(cached_file *e) {
+    int32_t fd = e->fd;
+    uint16_t uses = e->uses;
+    e->fd = -2;
+    e->uses = 0;
+    e->hash = 0;
+    retire_fd(fd, uses);
+}
+
+static uint64_t path_hash(const char *s, uint32_t n) {
+    uint64_t h = 14695981039346656037ull;
+    for (uint32_t i = 0; i < n; i++) {
+        h ^= (uint8_t)s[i];
+        h *= 1099511628211ull;
+    }
+    return h ? h : 1;
+}
+
+static void fill_entry(cached_file *e, uint64_t hash, const char *path, uint32_t len,
+                       int32_t fd, const struct stat *st, const char *mime,
+                       uint64_t now_ms) {
+    e->hash = hash;
+    e->checked_ms = now_ms;
+    e->mtime_sec = (int64_t)st->st_mtim.tv_sec;
+    e->mtime_nsec = (int64_t)st->st_mtim.tv_nsec;
+    e->size = st->st_size;
+    e->ino = (uint64_t)st->st_ino;
+    e->mime = mime;
+    e->fd = fd;
+    e->path_len = (uint16_t)len;
+    e->uses = 0;
+    memcpy(e->path, path, len);
+    e->path[len] = '\0';
+}
+
+static int32_t same_meta(const cached_file *e, const struct stat *st) {
+    return st->st_size == e->size &&
+           (int64_t)st->st_mtim.tv_sec == e->mtime_sec &&
+           (int64_t)st->st_mtim.tv_nsec == e->mtime_nsec &&
+           (uint64_t)st->st_ino == e->ino;
+}
+
+static cached_file *file_cache_find(const char *path, uint32_t len) {
+    file_cache_init();
+    if (len == 0 || len >= FILE_CACHE_PATH) {
+        return 0;
+    }
+    uint64_t hash = path_hash(path, len);
+    uint32_t slot = (uint32_t)hash & (FILE_CACHE_SLOTS - 1);
+    for (uint32_t n = 0; n < FILE_CACHE_SLOTS; n++) {
+        cached_file *e = &file_cache[slot];
+        if (e->fd == -1) {
+            return 0;
+        }
+        if (e->fd >= 0 && e->hash == hash && e->path_len == len &&
+            memcmp(e->path, path, len) == 0) {
+            return e;
+        }
+        slot = (slot + 1) & (FILE_CACHE_SLOTS - 1);
+    }
+    return 0;
+}
+
+/* 1: entry is current. 0: dropped, caller should open the path itself. */
+static int32_t file_cache_recheck(cached_file *e, uint64_t now_ms) {
+    struct stat st;
+    int32_t flags;
+    int32_t fd;
+
+    if (now_ms - e->checked_ms < FILE_CACHE_RECHECK_MS) {
+        return 1;
+    }
+    flags = g_policy.allow_symlinks ? 0 : AT_SYMLINK_NOFOLLOW;
+    if (fstatat(docroot_fd, e->path, &st, flags) < 0 ||
+        !S_ISREG(st.st_mode) || st.st_size < 0) {
+        tombstone(e);
+        return 0;
+    }
+    if (same_meta(e, &st)) {
+        e->checked_ms = now_ms;
+        return 1;
+    }
+    fd = open_under_docroot(e->path);
+    if (fd < 0) {
+        tombstone(e);
+        return 0;
+    }
+    retire_fd(e->fd, e->uses);
+    e->fd = fd;
+    e->uses = 0;
+    e->size = st.st_size;
+    e->mtime_sec = (int64_t)st.st_mtim.tv_sec;
+    e->mtime_nsec = (int64_t)st.st_mtim.tv_nsec;
+    e->ino = (uint64_t)st.st_ino;
+    e->mime = mime_from_path(e->path, e->path_len);
+    e->checked_ms = now_ms;
+    return 1;
+}
+
+static void file_cache_hold(cached_file *e) {
+    if (e->uses < UINT16_MAX) {
+        e->uses++;
+    }
+}
+
+/* Returns the entry if the cache now owns fd. */
+static cached_file *file_cache_store(const char *path, uint32_t len, int32_t fd,
+                                    const struct stat *st, const char *mime,
+                                    uint64_t now_ms) {
+    int32_t reuse = -1;
+    uint64_t hash;
+    uint32_t slot;
+
+    file_cache_init();
+    if (len == 0 || len >= FILE_CACHE_PATH || fd < 0) {
+        return 0;
+    }
+    hash = path_hash(path, len);
+    slot = (uint32_t)hash & (FILE_CACHE_SLOTS - 1);
+    for (uint32_t n = 0; n < FILE_CACHE_SLOTS; n++) {
+        cached_file *e = &file_cache[slot];
+        if (e->fd == -1) {
+            fill_entry(e, hash, path, len, fd, st, mime, now_ms);
+            return e;
+        }
+        if (e->fd == -2 && reuse < 0) {
+            reuse = (int32_t)slot;
+        }
+        slot = (slot + 1) & (FILE_CACHE_SLOTS - 1);
+    }
+    if (reuse >= 0) {
+        cached_file *e = &file_cache[reuse];
+        fill_entry(e, hash, path, len, fd, st, mime, now_ms);
+        return e;
+    }
+    return 0;
+}
+
+void static_cache_release(int32_t fd) {
+    if (!file_cache_ready || fd < 0) {
+        return;
+    }
+    for (uint32_t i = 0; i < FILE_CACHE_SLOTS; i++) {
+        if (file_cache[i].fd == fd) {
+            if (file_cache[i].uses > 0) {
+                file_cache[i].uses--;
+            }
+            return;
+        }
+    }
+    for (uint32_t i = 0; i < FILE_CACHE_RETIRED; i++) {
+        if (file_cache_retired[i].fd == fd) {
+            if (file_cache_retired[i].uses > 0) {
+                file_cache_retired[i].uses--;
+            }
+            if (file_cache_retired[i].uses == 0) {
+                close(fd);
+                file_cache_retired[i].fd = -1;
+            }
+            return;
+        }
+    }
+}
+
+void static_cache_clear(void) {
+    if (!file_cache_ready) {
+        return;
+    }
+    for (uint32_t i = 0; i < FILE_CACHE_SLOTS; i++) {
+        if (file_cache[i].fd >= 0) {
+            close(file_cache[i].fd);
+            file_cache[i].fd = -1;
+        }
+    }
+    for (uint32_t i = 0; i < FILE_CACHE_RETIRED; i++) {
+        if (file_cache_retired[i].fd >= 0) {
+            close(file_cache_retired[i].fd);
+            file_cache_retired[i].fd = -1;
+        }
+    }
+    file_cache_ready = 0;
+}
+
+static void cork(http_conn *hc, int32_t on);
+
+static int32_t arm_regular(http_conn *hc, int32_t file_fd, off_t size,
+                           const char *mime, uint8_t owned, uint64_t now_ms) {
+    char *hdr = bump_alloc(hc->arena, STATIC_HDR_SIZE, 1);
+    if (!hdr) {
+        if (owned) {
+            close(file_fd);
+        }
+        ARM_CLOSE(hc, RESPONSE_500, 500, now_ms);
+        return HTTP_IO_WANT_WRITE;
+    }
+
+    hc->keep = http_should_keepalive(&hc->req);
+    hc->status_code = 200;
+
+    int32_t hdr_len = snprintf(hdr, STATIC_HDR_SIZE,
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: %lld\r\n"
+        "Content-Type: %s\r\n"
+        "Connection: %s\r\n"
+        "\r\n",
+        (long long)size,
+        mime,
+        hc->keep ? "keep-alive" : "close");
+
+    if (hdr_len < 0 || (uint32_t)hdr_len >= STATIC_HDR_SIZE) {
+        if (owned) {
+            close(file_fd);
+        }
+        ARM_CLOSE(hc, RESPONSE_500, 500, now_ms);
+        return HTTP_IO_WANT_WRITE;
+    }
+
+    hc->out_hdr = hdr;
+    hc->out_hdr_len = (uint32_t)hdr_len;
+    hc->out_hdr_off = 0;
+    hc->file_fd = file_fd;
+    hc->file_owned = owned;
+    hc->file_size = size;
+    hc->file_off = 0;
+    hc->send_body = (hc->req.method == HTTP_METHOD_GET && size > 0) ? 1 : 0;
+    hc->phase = HTTP_PHASE_WRITE_HDR;
+    hc->deadline_ms = now_ms + hc->send_timeout_ms;
+    cork(hc, 1);
+    return HTTP_IO_WANT_WRITE;
 }
 
 static void cork(http_conn *hc, int32_t on) {
@@ -452,6 +763,14 @@ int32_t static_begin(http_conn *hc, uint64_t now_ms) {
         return HTTP_IO_WANT_WRITE;
     }
 
+    cached_file *hit = file_cache_find(rel, rel_len);
+    if (hit && file_cache_recheck(hit, now_ms)) {
+        file_cache_hold(hit);
+        int32_t rc = arm_regular(hc, hit->fd, hit->size, hit->mime, 0, now_ms);
+        STAT_TIME_END(STAT_NS_BEGIN, STAT_NS_BEGIN_N, begin);
+        return rc;
+    }
+
     int32_t file_fd = open_under_docroot(rel);
     if (file_fd < 0) {
         arm_open_error(hc, rel, now_ms);
@@ -478,6 +797,14 @@ int32_t static_begin(http_conn *hc, uint64_t now_ms) {
         rel_len += 11;
         rel[rel_len] = '\0';
 
+        hit = file_cache_find(rel, rel_len);
+        if (hit && file_cache_recheck(hit, now_ms)) {
+            file_cache_hold(hit);
+            int32_t rc = arm_regular(hc, hit->fd, hit->size, hit->mime, 0, now_ms);
+            STAT_TIME_END(STAT_NS_BEGIN, STAT_NS_BEGIN_N, begin);
+            return rc;
+        }
+
         file_fd = open_under_docroot(rel);
         if (file_fd < 0) {
             arm_open_error(hc, rel, now_ms);
@@ -497,44 +824,15 @@ int32_t static_begin(http_conn *hc, uint64_t now_ms) {
     }
 
     const char *mime = mime_from_path(rel, rel_len);
-    char *hdr = bump_alloc(hc->arena, STATIC_HDR_SIZE, 1);
-    if (!hdr) {
-        close(file_fd);
-        ARM_CLOSE(hc, RESPONSE_500, 500, now_ms);
-        return HTTP_IO_WANT_WRITE;
+    uint8_t owned = 1;
+    cached_file *stored = file_cache_store(rel, rel_len, file_fd, &st, mime, now_ms);
+    if (stored) {
+        file_cache_hold(stored);
+        owned = 0;
     }
-
-    hc->keep = http_should_keepalive(&hc->req);
-    hc->status_code = 200;
-
-    int32_t hdr_len = snprintf(hdr, STATIC_HDR_SIZE,
-        "HTTP/1.1 200 OK\r\n"
-        "Content-Length: %lld\r\n"
-        "Content-Type: %s\r\n"
-        "Connection: %s\r\n"
-        "\r\n",
-        (long long)st.st_size,
-        mime,
-        hc->keep ? "keep-alive" : "close");
-
-    if (hdr_len < 0 || (uint32_t)hdr_len >= STATIC_HDR_SIZE) {
-        close(file_fd);
-        ARM_CLOSE(hc, RESPONSE_500, 500, now_ms);
-        return HTTP_IO_WANT_WRITE;
-    }
-
-    hc->out_hdr = hdr;
-    hc->out_hdr_len = (uint32_t)hdr_len;
-    hc->out_hdr_off = 0;
-    hc->file_fd = file_fd;
-    hc->file_size = st.st_size;
-    hc->file_off = 0;
-    hc->send_body = (hc->req.method == HTTP_METHOD_GET && st.st_size > 0) ? 1 : 0;
-    hc->phase = HTTP_PHASE_WRITE_HDR;
-    hc->deadline_ms = now_ms + hc->send_timeout_ms;
-    cork(hc, 1);
+    int32_t rc = arm_regular(hc, file_fd, st.st_size, mime, owned, now_ms);
     STAT_TIME_END(STAT_NS_BEGIN, STAT_NS_BEGIN_N, begin);
-    return HTTP_IO_WANT_WRITE;
+    return rc;
 }
 
 int32_t static_on_write(http_conn *hc, uint64_t now_ms) {
@@ -568,9 +866,14 @@ int32_t static_on_write(http_conn *hc, uint64_t now_ms) {
         if (!hc->send_body) {
             cork(hc, 0);
             if (hc->file_fd >= 0) {
-                close(hc->file_fd);
-                hc->file_fd = -1;
+                if (hc->file_owned) {
+                    close(hc->file_fd);
+                } else {
+                    static_cache_release(hc->file_fd);
+                }
             }
+            hc->file_fd = -1;
+            hc->file_owned = 1;
             note_done(hc);
             return HTTP_IO_DONE;
         }
@@ -605,9 +908,14 @@ int32_t static_on_write(http_conn *hc, uint64_t now_ms) {
 
     cork(hc, 0);
     if (hc->file_fd >= 0) {
-        close(hc->file_fd);
-        hc->file_fd = -1;
+        if (hc->file_owned) {
+            close(hc->file_fd);
+        } else {
+            static_cache_release(hc->file_fd);
+        }
     }
+    hc->file_fd = -1;
+    hc->file_owned = 1;
     note_done(hc);
     return HTTP_IO_DONE;
 }

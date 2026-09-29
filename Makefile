@@ -11,11 +11,20 @@ SERVER_HDR = src/allocator.h src/connection.h src/http.h src/static.h src/stats.
 	src/logger.h src/worker.h src/config.h src/runtime.h
 
 
-.PHONY: all clean bench perf server-stats
+.PHONY: all clean bench perf server-stats default-page
 
-all: server client
+all: server client default-page
 
-server: $(SERVER_SRC) $(SERVER_HDR)
+# Compiled config.h values. index.html is not a target.
+default-page: www/defaults.tiny
+
+www/defaults.tiny: scripts/dump-defaults.c src/config.h
+	$(CC) $(CFLAGS) -o www/.dump-defaults scripts/dump-defaults.c
+	./www/.dump-defaults > $@.tmp
+	mv $@.tmp $@
+	rm -f www/.dump-defaults
+
+server: $(SERVER_SRC) $(SERVER_HDR) | default-page
 	$(CC) $(CFLAGS) -o $@ $(SERVER_SRC) $(LDFLAGS)
 
 server-stats: $(SERVER_SRC) $(SERVER_HDR)
@@ -33,4 +42,8 @@ perf: server
 	./scripts/bench.sh --bin ./server --duration $(DURATION) --threads $(THREADS) --peer $(PEER) --perf
 
 clean:
-	rm -f server client src/*.gch perf.data
+	rm -f server client src/*.gch perf.data \
+		www/.dump-defaults www/defaults.tiny www/defaults.tiny.tmp \
+		www/.tiny-defaults www/.tiny-defaults.tmp \
+		www/.default-page.stamp www/default.html www/defaults.html \
+		www/tiny-default.html www/tiny-defaults.html

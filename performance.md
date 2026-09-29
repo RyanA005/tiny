@@ -105,3 +105,145 @@ high_c           401139.50     291456.70      99668.28       1.38x        4.02x
 - Ahead of nginx on every case. Large-file transfer was 17.30 GB / 30s (nginx 16.45 GB), closer to the wall-power runs (~19-20 GB) than the busier battery runs (~10 GB).
 - 6 workers restored keepalive (`small` 1.14x, `high_c` 1.38x) after 4 workers had dropped those to 0.61x and 1.03x. `small_close` stayed ahead (2.22x) because the accept wake is 6 threads, not 8.
 - Socket timeouts still present under sustained load on all three servers.
+
+---
+
+## 2026-09-29 13:28 UTC
+
+- **commit:** `f9662d9ef466486997907ab523dbe280a8bea2b0` + uncommitted
+- **host:** same WSL2 i7-13700H, battery
+- **bench:** duration 10s, threads 4, peer nginx (apache skipped)
+
+### State
+
+Skip `epoll_ctl(EPOLL_CTL_MOD)` when the slot is already armed for the same interest. `tiny_slot.armed_io` stores `HTTP_IO_WANT_READ` or `HTTP_IO_WANT_WRITE`. Accept still `EPOLL_CTL_ADD`s with `EPOLLIN` and sets `armed_io` to read, so the extra MOD on a connection that stays readable is gone. A real READ to WRITE or WRITE to READ transition still mods.
+
+### Comparison (Requests/sec)
+
+10s baseline immediately before this change, same binary settings otherwise:
+
+```
+case                  tiny         nginx   tiny/nginx
+------------  ------------  ------------  ----------
+small            203839.80     255665.56       0.80x
+small_close       74759.79      36317.96       2.06x
+medium           129941.61     101903.94       1.28x
+large             19569.22      18963.35       1.03x
+not_found        343369.00     242140.44       1.42x
+high_c           394486.77     285994.78       1.38x
+```
+
+After:
+
+```
+case                  tiny         nginx   tiny/nginx
+------------  ------------  ------------  ----------
+small            303180.66     256183.37       1.18x
+small_close       75520.60      36595.64       2.06x
+medium           125755.79      99399.41       1.27x
+large             18662.35      18080.27       1.03x
+not_found        353126.11     246239.38       1.43x
+high_c           398774.56     296761.08       1.34x
+```
+
+### Notes
+
+- `small` moved 0.80x to 1.18x. nginx held ~256k both runs, so that jump is on tiny. It also lands on the earlier 30s result (293k, 1.14x), and the 10s baseline `small` was the outlier.
+- `small_close`, `medium`, `large`, and `not_found` ratios stayed within 0.01x. `high_c` 1.38x to 1.34x while absolute tiny rps rose slightly and nginx rose more.
+- Kept. The MOD is still required on an actual interest change, which is once per request in each direction on the keepalive path.
+
+---
+
+## 2026-09-29 13:31 UTC
+
+- **commit:** `f9662d9ef466486997907ab523dbe280a8bea2b0` + uncommitted
+- **host:** same WSL2 i7-13700H, battery. This run was slower overall (nginx `small` 256k to 236k, `not_found` 246k to 237k).
+- **bench:** duration 10s, threads 4, peer nginx (apache skipped)
+
+### State
+
+Replaced the two `TCP_CORK` setsockopt calls around a static response with `MSG_MORE` on the header `send` when a body follows, then `sendfile` in the same call. Cork was removed, including the uncork on connection cleanup. Responses still completed (200 with full body, 404, two keep-alive responses on one socket).
+
+### Comparison (Requests/sec)
+
+Previous entry (cork kept, epoll MOD skipped) is the before. After `MSG_MORE`:
+
+```
+case                  tiny         nginx   tiny/nginx
+------------  ------------  ------------  ----------
+small            237121.76     236296.92       1.00x
+small_close       64756.98      33510.33       1.93x
+medium           113368.44      88844.01       1.28x
+large             17456.97      17726.65       0.98x
+not_found        313659.29     236641.42       1.33x
+high_c           382118.94     302227.88       1.26x
+```
+
+### Notes
+
+- `small` fell 1.18x to 1.00x. `not_found` does not touch this path and also fell (1.43x to 1.33x), so part of the drop is the machine, but `small` fell further than that.
+- `large` went from 1.03x to 0.98x. `medium` stayed 1.28x.
+- Reverted to `TCP_CORK`. The setsockopt pair stays.
+
+---
+
+## 2026-09-29 13:36 UTC
+
+- **commit:** `f9662d9ef466486997907ab523dbe280a8bea2b0` + uncommitted
+- **host:** same WSL2 i7-13700H, battery. Still the slower stretch (nginx `small` 238k, versus 256k on the epoll run).
+- **bench:** duration 10s, threads 4, peer nginx (apache skipped)
+
+### State
+
+`nactive` was already counted without scanning slots. `try_accept_one` still walked the slot array from index 0 to find a free one. Each worker now keeps a free stack of slot indexes (`uint16_t`, 128 entries because `TINY_CONNS_PER_WORKER` is 128, so one `uint64_t` bitmap does not cover it). Pop on accept, push on close. Deadline sweep still walks slots, and returns immediately when `nactive` is 0. Cork and the epoll `armed_io` skip are still in place.
+
+### Comparison (Requests/sec)
+
+```
+case                  tiny         nginx   tiny/nginx
+------------  ------------  ------------  ----------
+small            264437.47     238206.62       1.11x
+small_close       64503.72      33636.97       1.92x
+medium           110955.06      86966.38       1.28x
+large             16663.18      15849.26       1.05x
+not_found        297795.06     227698.55       1.31x
+high_c           362272.50     305769.25       1.18x
+```
+
+### Notes
+
+- No clear win against the epoll+cork run (`small` 1.18x, `small_close` 2.06x, `not_found` 1.43x, `high_c` 1.34x). nginx was slower on every case in this run, and `not_found` (almost no accepts after ramp-up) moved about as much as `small_close` (an accept every request).
+- Kept. Accept is O(1) in the slot table, and the ratios did not show a regression past the machine movement. `medium` stayed 1.28x and `large` was 1.05x.
+
+---
+
+## 2026-09-29 13:40 UTC
+
+- **commit:** `f9662d9ef466486997907ab523dbe280a8bea2b0` + uncommitted
+- **host:** same WSL2 i7-13700H, battery. nginx `small` 241k, in line with the previous 10s run (238k).
+- **bench:** duration 10s, threads 4, peer nginx (apache skipped)
+
+### State
+
+Per-worker open-file cache: 64 slots, FNV-1a of the relative path, linear probe, no eviction and no invalidation. A hit reuses the cached fd, size, and MIME string. `sendfile` uses an explicit offset, so the fd stays open for the life of the worker. `http_conn.file_owned` stops cleanup from closing a cached fd. Misses still `openat2` + `fstat`, then insert. 404s are not cached. Header `snprintf` and `TCP_CORK` are unchanged. Epoll `armed_io` skip and the free-slot stack are still in place.
+
+### Comparison (Requests/sec)
+
+```
+case                  tiny         nginx   tiny/nginx
+------------  ------------  ------------  ----------
+small            290539.10     240856.92       1.21x
+small_close       65047.02      34045.40       1.91x
+medium           116901.91      88375.06       1.32x
+large             14925.23      15074.51       0.99x
+not_found        321699.53     230097.45       1.40x
+high_c           431396.12     297640.94       1.45x
+```
+
+### Notes
+
+- Real win on the keepalive file cases. Against the previous 10s run on a similar nginx (`small` 1.11x, `high_c` 1.18x): `small` 1.21x, `high_c` 1.45x (362k to 431k while nginx stayed ~300k). `medium` 1.28x to 1.32x.
+- `small_close` stayed 1.91x. A new connection every request, so accept and close dominate the open.
+- `not_found` is not cached. It moved 1.31x to 1.40x anyway; do not credit the cache for that.
+- `large` 1.05x to 0.99x. One open per connection, then the run is `sendfile`. Tied with nginx.
+- Kept. A replaced file is served from the old inode until the worker exits.

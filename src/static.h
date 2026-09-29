@@ -12,6 +12,10 @@ typedef struct {
 
 int32_t static_init(const char *docroot);
 void static_shutdown(void);
+/* Drop this thread's open-file cache. Call from each worker before exit. */
+void static_cache_clear(void);
+/* A request finished with a cached fd. Does not close the live cache fd. */
+void static_cache_release(int32_t fd);
 void static_set_policy(static_policy policy);
 static_policy static_get_policy(void);
 

@@ -153,6 +153,7 @@ static void reset_request_state(http_conn *hc, uint64_t now_ms, uint64_t idle_ms
     hc->file_fd = -1;
     hc->file_size = 0;
     hc->file_off = 0;
+    hc->file_owned = 1;
     hc->send_body = 0;
     hc->cork_on = 0;
     hc->keep = 0;
@@ -178,9 +179,14 @@ int32_t http_conn_prepare(http_conn *hc, bump *arena, uint64_t now_ms) {
 
 void http_conn_cleanup(http_conn *hc) {
     if (hc->file_fd >= 0) {
-        close(hc->file_fd);
-        hc->file_fd = -1;
+        if (hc->file_owned) {
+            close(hc->file_fd);
+        } else {
+            static_cache_release(hc->file_fd);
+        }
     }
+    hc->file_fd = -1;
+    hc->file_owned = 1;
     if (hc->cork_on && hc->conn.fd >= 0) {
         int32_t on = 0;
         setsockopt(hc->conn.fd, IPPROTO_TCP, TCP_CORK, &on, sizeof(on));

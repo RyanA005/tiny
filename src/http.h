@@ -80,6 +80,7 @@ typedef struct http_conn {
     uint8_t send_body;
     uint8_t cork_on;
     uint8_t keep;
+    uint8_t file_owned; /* 1: cleanup closes file_fd. 0: open-file cache owns it. */
     uint16_t status_code;
 
     uint64_t deadline_ms;

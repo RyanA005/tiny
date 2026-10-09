@@ -1,6 +1,6 @@
 this is a very tiny web server written by Ryan Alport for demo use
 
-![default page](www/assets/default.png)
+![default page](www/default.png)
 
 while this server has many features and performs incredibly well in select test cases, it is not proven for production use
 

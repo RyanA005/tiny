@@ -10,6 +10,10 @@ a server executable will be generated as well as a file called www/defaults.tiny
 
 config supports a worker thread count, listening backlogs, queue sizes, connection allocated buffer sizes, etc. recompile to update the executable
 
+this server is designed with performance in mind, the following benchamrks show a wrk p50 comparison with apache and nginx for several different static file serving dynamics 
+
+![stats](www/stats.png)
+
 the project is built as a learning experiment as well as a demo on optimizing low level programs
 
 the accompanying presentation can be found here: https://iheartcomputer.club/projects/web-server/
